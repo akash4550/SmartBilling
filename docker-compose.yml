@@ -1,0 +1,44 @@
+# =============================================================================
+# Docker Compose — Smart Billing + PostgreSQL
+#
+# Usage:
+#   1. Copy .env.example to .env and set OPENAI_API_KEY / POSTGRES_PASSWORD.
+#   2. docker compose up --build
+#   3. App will be available at http://localhost:3000
+# =============================================================================
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: smart-billing-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-smartbill}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-smartbill}
+      POSTGRES_DB: ${POSTGRES_DB:-smart_billing}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-smartbill} -d ${POSTGRES_DB:-smart_billing}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    container_name: smart-billing-app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-smartbill}:${POSTGRES_PASSWORD:-smartbill}@db:5432/${POSTGRES_DB:-smart_billing}?schema=public
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      NODE_ENV: production
+    ports:
+      - "3000:3000"
+
+volumes:
+  postgres_data:

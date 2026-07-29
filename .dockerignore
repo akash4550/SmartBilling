@@ -1,0 +1,41 @@
+# Dependencies
+node_modules
+npm-debug.log
+yarn-error.log
+
+# Next.js build output (we build inside the image)
+.next
+out
+dist
+build
+
+# Environment (don't bake secrets into the image)
+.env
+.env*.local
+
+# Development & misc
+.git
+.gitignore
+.dockerignore
+Dockerfile
+docker-compose*.yml
+README.md
+.vscode
+.idea
+*.log
+
+# Prisma artifacts that will be regenerated
+prisma/migrations/dev.db*
+
+# OS/tooling
+.DS_Store
+Thumbs.db
+coverage
+*.tsbuildinfo
+next-env.d.ts
+
+# Skills/agent metadata (from project bootstrap)
+.agents
+.claude
+.windsurf
+skills-lock.json
