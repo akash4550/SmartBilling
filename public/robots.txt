@@ -1,0 +1,15 @@
+User-agent: *
+Allow: /
+Disallow: /view/
+Disallow: /portal/
+Disallow: /api/
+Disallow: /invoices/
+Disallow: /clients/
+Disallow: /dashboard/
+Disallow: /settings/
+Disallow: /recurring/
+Disallow: /expenses/
+Disallow: /login
+Disallow: /register
+Disallow: /forgot-password
+Disallow: /reset-password
