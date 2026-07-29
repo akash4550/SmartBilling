@@ -19,7 +19,7 @@ A modern, full-stack invoicing and billing application built with:
 
 ## 🌐 Live Demo
 
-Deployed on Vercel: [**https://smart-bill-theta.vercel.app/login**](https://smart-bill-theta.vercel.app/login)
+Deployed on Vercel: [**https://smart-bill-one-liard.vercel.app/login**](https://smart-bill-one-liard.vercel.app/login)
 
 **Demo admin credentials** (seeded, see below):
 - Email: `admin@smartbill.com`
