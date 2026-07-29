@@ -1,0 +1,335 @@
+// Prisma schema for Smart Billing Application
+// Uses PostgreSQL as the database provider
+//
+// Multi-tenant: every Client, Invoice, and Settings row belongs to a User.
+// All write queries are scoped by userId (from session), and uniqueness
+// constraints are scoped per-user where appropriate.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// USER MODEL
+// ============================================================
+model User {
+  id                String     @id @default(cuid())
+  name              String
+  email             String     @unique
+  passwordHash      String
+  resetToken        String?    @unique
+  resetTokenExpires DateTime?
+  createdAt         DateTime   @default(now())
+  updatedAt         DateTime   @updatedAt
+
+  settings           Settings?
+  clients            Client[]
+  invoices           Invoice[]
+  expenses           Expense[]
+  recurringProfiles  RecurringProfile[]
+  activities         InvoiceActivity[]
+
+  @@map("users")
+}
+
+// ============================================================
+// SETTINGS MODEL
+// ============================================================
+// One row per user (userId is unique). Created lazily on first
+// access via prisma.settings.upsert({ where: { userId }, ... }).
+model Settings {
+  id              Int      @id @default(autoincrement())
+  userId          String   @unique
+  companyName     String   @default("Your Business Name")
+  companyEmail    String   @default("billing@example.com")
+  companyAddress  String?
+  companyPhone    String?
+  defaultTaxRate  Decimal  @default(0) @db.Decimal(5, 2)
+  // Label shown next to the tax amount (e.g. "GST", "VAT", "TAX", "IGST").
+  // Up to 12 chars; defaults to "GST" for INR merchants, "TAX" otherwise.
+  taxLabel        String   @default("GST")
+  currency        String   @default("INR")
+  // Optional company logo (base64 data URI, max ~1 MB after client resize).
+  // Used on invoice PDFs and in email headers. Displayed at up to ~180px
+  // wide / 60px tall. null/empty = no logo (falls back to initial badge).
+  logoData        String?  @db.Text
+  logoContentType String?
+  // Accent/brand color (hex, e.g. "#2563eb"). Used for PDF accent bar,
+  // invoice title, CTA buttons in emails, and totals highlight.
+  brandColor      String   @default("#2563eb")
+  // Default terms/notes pre-filled on every new invoice (e.g. payment
+  // instructions, bank details, late-fee policy). Can be overridden per
+  // invoice.
+  defaultNotes    String?  @db.Text
+  // Default due days (0 = due on receipt, N = due in N days). Pre-fills
+  // due date when creating a new invoice.
+  defaultDueDays  Int      @default(30)
+  // Invoice number prefix (alphanumeric, e.g. "INV", "ACME", "BIL").
+  // Generator produces: <PREFIX><sep>YYYYMMDD<sep>NNNN.
+  invoicePrefix   String   @default("INV")
+  // Separator between prefix, date, and sequence number. Default "-".
+  invoiceSeparator String  @default("-")
+  // Zero-padding of sequence number. Default 4 (→ 0001).
+  invoicePad      Int      @default(4)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("settings")
+}
+
+// ============================================================
+// CLIENT MODEL
+// ============================================================
+// Uniqueness of email is scoped to the owning user (two tenants
+// can each have a client with the same email).
+model Client {
+  id        String    @id @default(cuid())
+  userId    String
+  name      String
+  email     String
+  address   String?
+  phone     String?
+  // Free-form internal notes about this client (e.g. preferred contact method,
+  // billing preferences, account manager). Not shown to the client.
+  notes     String?   @db.Text
+  // Optional per-client payment term override (in days). When set, creating an
+  // invoice for this client uses this value instead of the user's
+  // defaultDueDays. null/undefined means fall back to user default.
+  dueDays   Int?
+  // Random, non-guessable token used as the key for the client portal URL
+  // (/portal/<token>). Generated on creation; can be rotated from the admin UI.
+  portalToken String @default(cuid()) @unique
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  user     User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  invoices Invoice[]
+  recurringProfiles RecurringProfile[]
+
+  @@unique([userId, email], name: "client_email_per_user")
+  @@index([userId])
+  @@map("clients")
+}
+
+// ============================================================
+// INVOICE MODEL
+// ============================================================
+// invoiceNumber is unique globally so the public /view/:id link
+// never collides between tenants. userId is included for fast
+// tenant-scoped queries, and we cascade deletes through the
+// client relation as before.
+model Invoice {
+  id            String        @id @default(cuid())
+  userId        String
+  invoiceNumber String        @unique
+  clientId      String
+  status        InvoiceStatus @default(DRAFT)
+  issueDate     DateTime      @db.Date
+  dueDate       DateTime      @db.Date
+  subtotal      Decimal       @db.Decimal(12, 2)
+  // Discount (applied pre-tax). discountType controls whether discountValue
+  // is treated as a percentage (0..100) or a flat amount in the invoice
+  // currency. Default NULL means no discount.
+  discountType  DiscountType?
+  discountValue Decimal?      @db.Decimal(12, 2)
+  discountAmount Decimal      @default(0) @db.Decimal(12, 2) // computed absolute discount in currency
+  taxRate       Decimal       @default(0) @db.Decimal(5, 2)
+  // Label shown next to the tax line for this invoice (copied from settings
+  // at create-time so changing settings later doesn't rewrite historical
+  // invoices).
+  taxLabel      String        @default("GST")
+  totalAmount   Decimal       @db.Decimal(12, 2)
+  notes         String?       @db.Text
+  paidAt        DateTime?
+  lastSentAt    DateTime?
+  lastRemindedAt DateTime?
+  stripeCheckoutSessionId String? @unique
+  stripePaymentIntentId String?
+  razorpayOrderId String?
+  razorpayPaymentId String?
+  razorpaySignature String?
+  // Recurring profile that generated this invoice (set automatically when
+  // created by the recurring generator; null for one-off invoices).
+  recurringProfileId String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  user     User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  client   Client           @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  items    InvoiceItem[]
+  recurring RecurringProfile? @relation(fields: [recurringProfileId], references: [id], onDelete: SetNull)
+  activities InvoiceActivity[]
+
+  @@index([userId])
+  @@index([clientId])
+  @@index([userId, status])
+  @@map("invoices")
+}
+
+// ============================================================
+// INVOICE ITEM MODEL
+// ============================================================
+model InvoiceItem {
+  id          String  @id @default(cuid())
+  invoiceId   String
+  description String
+  quantity    Int     @default(1)
+  price       Decimal @db.Decimal(12, 2)
+  total       Decimal @db.Decimal(12, 2)
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId])
+  @@map("invoice_items")
+}
+
+// ============================================================
+// RECURRING PROFILE MODEL
+// ============================================================
+// Template for auto-generated invoices. When `active` is true and
+// `nextRunAt` <= now, the cron endpoint (/api/cron/generate-recurring)
+// will issue a new Invoice using this profile's clientId, line items,
+// taxRate, notes, and frequency, then advance `nextRunAt`.
+model RecurringProfile {
+  id           String          @id @default(cuid())
+  userId       String
+  clientId     String
+  frequency    RecurrenceFrequency // WEEKLY, MONTHLY, YEARLY, CUSTOM_DAYS
+  intervalDays Int?            // when frequency=CUSTOM_DAYS, interval in days
+  // Default terms (issue date = today; due date = today + dueInDays).
+  dueInDays    Int             @default(30)
+  taxRate      Decimal         @default(0) @db.Decimal(5, 2)
+  notes        String?         @db.Text
+  // What to do after generation: DRAFT (just create) or AUTO_SEND (mark
+  // PENDING + email the client with a Pay Now link).
+  autoSend     Boolean         @default(true)
+  active       Boolean         @default(true)
+  // Anchor date used to compute the *next* issue date. Updated after each run.
+  nextRunAt    DateTime
+  endDate      DateTime?       // optional stop date
+  lastRunAt    DateTime?
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  user   User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  client Client    @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  items  RecurringItem[]
+  invoices Invoice[]
+
+  @@index([userId, active, nextRunAt])
+  @@index([userId])
+  @@map("recurring_profiles")
+}
+
+model RecurringItem {
+  id          String  @id @default(cuid())
+  profileId   String
+  description String
+  quantity    Int     @default(1)
+  price       Decimal @db.Decimal(12, 2)
+
+  profile RecurringProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@index([profileId])
+  @@map("recurring_items")
+}
+
+// ============================================================
+// INVOICE ACTIVITY MODEL
+// ============================================================
+// Append-only audit log of notable events for an invoice. Rendered as the
+// "Activity" timeline on invoice detail pages. Write-only — never updated
+// or deleted; events are created by the server on send/remind/pay/view/etc.
+model InvoiceActivity {
+  id        String            @id @default(cuid())
+  invoiceId String
+  userId    String
+  type      InvoiceActivityType
+  message   String?           @db.Text
+  // IP address of the actor (for client views this is the public IP; for
+  // admin actions it's the admin's IP). Useful for audit/debug.
+  ip        String?
+  // Optional structured metadata (e.g., payment provider, amount, email).
+  meta      Json?
+  createdAt DateTime          @default(now())
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId, createdAt])
+  @@index([userId])
+  @@map("invoice_activities")
+}
+
+// ============================================================
+// ENUMS
+// ============================================================
+enum InvoiceStatus {
+  DRAFT
+  PENDING
+  PAID
+  VOID
+}
+
+enum RecurrenceFrequency {
+  WEEKLY
+  MONTHLY
+  YEARLY
+  CUSTOM_DAYS
+}
+
+enum InvoiceActivityType {
+  CREATED
+  EDITED
+  SENT
+  REMINDED
+  VIEWED
+  PAID
+  PAYMENT_FAILED
+  MARKED_PAID
+  PDF_DOWNLOADED
+  DELETED
+  RECURRING_GENERATED
+  VOIDED
+  EMAIL_DELIVERED
+  EMAIL_BOUNCED
+  EMAIL_OPENED
+}
+
+enum DiscountType {
+  PERCENT
+  FIXED
+}
+
+// ============================================================
+// EXPENSE MODEL
+// ============================================================
+// Track business expenses (software subscriptions, contractor
+// payments, materials, etc.) for P&L reporting. Currency matches
+// the user's settings.currency; optional category for grouping.
+model Expense {
+  id          String   @id @default(cuid())
+  userId      String
+  date        DateTime @db.Date
+  category    String   @default("General") // e.g. Software, Travel, Materials, Marketing
+  description String
+  amount      Decimal  @db.Decimal(12, 2)
+  notes       String?  @db.Text
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, date])
+  @@index([userId, category])
+  @@map("expenses")
+}
+
+// Back-relation from User to Expense (add to User model below).
