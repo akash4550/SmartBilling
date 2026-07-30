@@ -21,6 +21,7 @@ import {
   CheckCheck,
   XCircle,
   MailOpen,
+  AlertOctagon,
 } from "lucide-react";
 import { formatDate } from "@/lib/utils";
 import type { InvoiceActivity, InvoiceActivityType } from "@/types";
@@ -113,6 +114,12 @@ const TYPE_META: Record<InvoiceActivityType, { icon: typeof History; label: stri
     label: "Email bounced",
     color: "text-red-600 dark:text-red-400",
     dotColor: "bg-red-500",
+  },
+  EMAIL_COMPLAINED: {
+    icon: AlertOctagon,
+    label: "Email marked as spam",
+    color: "text-orange-600 dark:text-orange-400",
+    dotColor: "bg-orange-500",
   },
   EMAIL_OPENED: {
     icon: MailOpen,

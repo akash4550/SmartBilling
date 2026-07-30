@@ -1,44 +1,83 @@
 /**
- * Stripe webhook endpoint.
+ * Stripe webhook endpoint (thin async ingester).
  *
- * Listens for `checkout.session.completed` and `payment_intent.succeeded` to
- * mark the associated invoice PAID. `payment_intent.payment_failed` writes
- * a PAYMENT_FAILED activity entry so the timeline shows the attempt.
+ * Security + latency model:
+ *   1. Fail-closed HMAC signature verification (same as before).
+ *   2. INSERT raw payload into WebhookIngestion staging table (deduped by
+ *      Stripe event id via unique constraint).
+ *   3. Return 202 Accepted — no business-logic DB writes, no external API
+ *      calls on the request path. End-to-end latency target <50ms.
  *
- * Unauthenticated but signature-protected against forged events.
+ * The `/api/cron/process-webhooks` worker picks up PENDING rows and
+ * runs the original invoice-payment processing out-of-band. This
+ * decouples Stripe delivery from our DB write budget and prevents
+ * webhook-burst connection exhaustion.
  */
 import { NextResponse } from "next/server";
-import { prisma } from "@/lib/prisma";
 import { getStripe, getStripeWebhookSecret } from "@/lib/stripe";
-import { markInvoicePaid, logPaymentFailed } from "@/lib/invoice-helpers";
+import { ingestWebhook } from "@/lib/webhook-ingestion";
 import type { Stripe } from "stripe";
 
 export const runtime = "nodejs";
+
+let _webhookConfigWarned = false;
+function warnIfMisconfiguredInProduction(hasSecret: boolean) {
+  if (_webhookConfigWarned) return;
+  if (
+    process.env.NODE_ENV === "production" &&
+    process.env.STRIPE_SECRET_KEY &&
+    !hasSecret
+  ) {
+    console.error(
+      "[stripe-webhook] CRITICAL: STRIPE_SECRET_KEY is set but STRIPE_WEBHOOK_SECRET is not. " +
+        "Refusing unsigned webhook events until STRIPE_WEBHOOK_SECRET is configured."
+    );
+  }
+  _webhookConfigWarned = true;
+}
 
 export async function POST(request: Request) {
   try {
     const stripe = await getStripe();
     if (!stripe) {
-      return NextResponse.json({ error: "Stripe not configured" }, { status: 503 });
+      return NextResponse.json(
+        { error: "Stripe not configured" },
+        { status: 503 }
+      );
     }
     const webhookSecret = getStripeWebhookSecret();
+    warnIfMisconfiguredInProduction(Boolean(webhookSecret));
 
     const signature = request.headers.get("stripe-signature");
-    if (!signature) {
-      return NextResponse.json({ error: "Missing stripe-signature header" }, { status: 400 });
-    }
-
     const rawBody = await request.text();
+
+    // ---------------- SIGNATURE VERIFICATION ----------------
     let event: Stripe.Event;
+
     if (webhookSecret) {
+      if (!signature) {
+        return NextResponse.json(
+          { error: "Missing stripe-signature header" },
+          { status: 400 }
+        );
+      }
       try {
         event = stripe.webhooks.constructEvent(rawBody, signature, webhookSecret);
       } catch (err) {
         const msg = err instanceof Error ? err.message : "Invalid signature";
         console.warn("[stripe-webhook] Signature verification failed:", msg);
-        return NextResponse.json({ error: "Invalid signature" }, { status: 400 });
+        return NextResponse.json(
+          { error: "Invalid signature" },
+          { status: 400 }
+        );
       }
     } else {
+      if (process.env.NODE_ENV === "production" && process.env.STRIPE_SECRET_KEY) {
+        return NextResponse.json(
+          { error: "Webhook signature verification misconfigured" },
+          { status: 503 }
+        );
+      }
       try {
         event = JSON.parse(rawBody) as Stripe.Event;
       } catch {
@@ -46,77 +85,30 @@ export async function POST(request: Request) {
       }
     }
 
-    switch (event.type) {
-      case "checkout.session.completed": {
-        const session = event.data.object as Stripe.Checkout.Session;
-        await handleSuccessfulPayment(session.id, session.payment_intent as string | null);
-        break;
-      }
-      case "payment_intent.succeeded": {
-        const pi = event.data.object as Stripe.PaymentIntent;
-        if (pi.metadata?.invoiceId) {
-          await markInvoicePaid(pi.metadata.invoiceId, {
-            provider: "stripe",
-            stripePaymentIntentId: pi.id,
-          });
-        }
-        break;
-      }
-      case "payment_intent.payment_failed": {
-        const pi = event.data.object as Stripe.PaymentIntent;
-        if (pi.metadata?.invoiceId) {
-          const reason = pi.last_payment_error?.message;
-          await logPaymentFailed(pi.metadata.invoiceId, "stripe", typeof reason === "string" ? reason : undefined, pi.id);
-        }
-        break;
-      }
-      case "checkout.session.expired": {
-        const session = event.data.object as Stripe.Checkout.Session;
-        if (session.metadata?.invoiceId) {
-          await prisma.invoice.updateMany({
-            where: {
-              id: session.metadata.invoiceId,
-              stripeCheckoutSessionId: session.id,
-              status: { not: "PAID" },
-            },
-            data: { stripeCheckoutSessionId: null },
-          });
-        }
-        break;
-      }
-      default:
-        break;
+    // ---------------- QUEUE FOR ASYNC PROCESSING ----------------
+    try {
+      await ingestWebhook({
+        provider: "stripe",
+        providerEventId: event.id,
+        eventType: event.type,
+        rawBody,
+        signature,
+      });
+    } catch (err) {
+      // If we fail to enqueue (e.g. DB down), return 500 so Stripe retries.
+      console.error("[stripe-webhook] Failed to enqueue event:", err);
+      return NextResponse.json(
+        { error: "Failed to enqueue event" },
+        { status: 500 }
+      );
     }
 
-    return NextResponse.json({ received: true }, { status: 200 });
+    return NextResponse.json({ received: true, queued: true }, { status: 202 });
   } catch (error) {
     console.error("[stripe-webhook] Error:", error);
-    return NextResponse.json({ error: "Webhook handler failed" }, { status: 500 });
+    return NextResponse.json(
+      { error: "Webhook handler failed" },
+      { status: 500 }
+    );
   }
-}
-
-async function handleSuccessfulPayment(sessionId: string, paymentIntentId: string | null) {
-  const invoice = await prisma.invoice.findFirst({
-    where: { stripeCheckoutSessionId: sessionId },
-    select: { id: true, status: true },
-  });
-  let invoiceId = invoice?.id;
-  if (!invoiceId) {
-    const stripe = await getStripe();
-    if (stripe) {
-      try {
-        const session = await stripe.checkout.sessions.retrieve(sessionId);
-        invoiceId = session.metadata?.invoiceId;
-      } catch (err) {
-        console.error("[stripe-webhook] Session lookup failed:", err);
-        return;
-      }
-    }
-  }
-  if (!invoiceId) return;
-  await markInvoicePaid(invoiceId, {
-    provider: "stripe",
-    stripePaymentIntentId: paymentIntentId ?? undefined,
-    stripeCheckoutSessionId: sessionId,
-  });
 }

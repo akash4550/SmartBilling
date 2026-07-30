@@ -3,6 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { requireUser, unauthorized, jsonError } from "@/lib/api-helpers";
 import { generateInvoiceNumber, calculateInvoiceTotals } from "@/lib/utils";
 import { logActivity, clientIp } from "@/lib/activity";
+import { withTenant } from "@/lib/tenant";
 
 interface RouteParams {
   params: Promise<{ id: string }>;
@@ -84,33 +85,36 @@ export async function POST(request: Request, { params }: RouteParams) {
       pad: Number(settings?.invoicePad) || 4,
     });
 
-    const invoice = await prisma.invoice.create({
-      data: {
-        userId: user.id,
-        invoiceNumber,
-        clientId: overrideClientId,
-        status: "DRAFT",
-        issueDate,
-        dueDate,
-        subtotal: totals.subtotal,
-        discountType: source.discountType,
-        discountValue: source.discountValue,
-        discountAmount: totals.discountAmount,
-        taxRate: source.taxRate,
-        taxLabel: source.taxLabel || "GST",
-        totalAmount: totals.total,
-        notes: source.notes,
-        items: {
-          create: lineItems.map((li) => ({
-            description: li.description,
-            quantity: li.quantity,
-            price: li.price,
-            total: li.total,
-          })),
+    const invoice = await withTenant(user.id, (tx) =>
+      tx.invoice.create({
+        data: {
+          userId: user.id,
+          invoiceNumber,
+          clientId: overrideClientId,
+          status: "DRAFT",
+          issueDate,
+          dueDate,
+          subtotal: totals.subtotal,
+          discountType: source.discountType,
+          discountValue: source.discountValue,
+          discountAmount: totals.discountAmount,
+          taxRate: source.taxRate,
+          taxLabel: source.taxLabel || "GST",
+          totalAmount: totals.total,
+          notes: source.notes,
+          items: {
+            create: lineItems.map((li) => ({
+              userId: user.id,
+              description: li.description,
+              quantity: li.quantity,
+              price: li.price,
+              total: li.total,
+            })),
+          },
         },
-      },
-      include: { client: true, items: true },
-    });
+        include: { client: true, items: true },
+      })
+    );
 
     logActivity({
       invoiceId: invoice.id,

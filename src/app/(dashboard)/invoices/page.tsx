@@ -35,6 +35,8 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { formatCurrency, formatDate, isInvoiceOverdue, dueLabel } from "@/lib/utils";
 import { downloadInvoicesCSV, type InvoiceForExport } from "@/lib/export-csv";
 import { PageTransition } from "@/components/page-transition";
+import { PageHeader } from "@/components/ui/page-header";
+import { EmptyState } from "@/components/ui/empty-state";
 import type { InvoiceWithRelations } from "@/types";
 
 interface StatusCounts {
@@ -279,37 +281,34 @@ function InvoicesList() {
 
   return (
     <PageTransition className="space-y-6">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h1 className="text-3xl font-bold tracking-tight bg-gradient-to-r from-slate-900 to-slate-700 dark:from-white dark:to-slate-300 bg-clip-text text-transparent">Invoices</h1>
-          <p className="text-slate-500 dark:text-slate-400 mt-1">
-            Create, track, and manage all your invoices
-          </p>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <Button
-            variant="outline"
-            onClick={handleExportCSV}
-            disabled={exporting || loading || !data || data.metadata.total === 0}
-            className="border-slate-200 dark:border-slate-700"
-          >
-            {exporting ? (
-              <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-            ) : (
-              <Download className="h-4 w-4 mr-2" />
-            )}
-            Export CSV
+      <PageHeader
+        title="Invoices"
+        description="Create, track, and manage all your invoices"
+        icon={<FileText className="h-5 w-5" strokeWidth={2.2} />}
+        iconGradient="from-blue-600 to-indigo-600"
+      >
+        <Button
+          variant="outline"
+          onClick={handleExportCSV}
+          disabled={exporting || loading || !data || data.metadata.total === 0}
+          className="border-slate-200 dark:border-slate-700 bg-white/70 dark:bg-slate-900/60"
+        >
+          {exporting ? (
+            <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+          ) : (
+            <Download className="h-4 w-4 mr-2" />
+          )}
+          Export CSV
+        </Button>
+        <Link href="/invoices/new">
+          <Button className="bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 shadow-lg shadow-blue-500/25">
+            <Plus className="h-4 w-4 mr-2" />
+            New Invoice
           </Button>
-          <Link href="/invoices/new">
-            <Button className="bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 shadow-lg shadow-blue-500/25">
-              <Plus className="h-4 w-4 mr-2" />
-              New Invoice
-            </Button>
-          </Link>
-        </div>
-      </div>
+        </Link>
+      </PageHeader>
 
-      <Card className="border-slate-200/60 dark:border-slate-800/60">
+      <Card className="surface overflow-hidden">
         <CardContent className="p-4 space-y-4">
           <div
             className="inline-flex rounded-xl bg-slate-100 dark:bg-slate-800/60 p-1"
@@ -372,7 +371,7 @@ function InvoicesList() {
         </CardContent>
       </Card>
 
-      <Card className="border-slate-200/60 dark:border-slate-800/60 overflow-hidden">
+      <Card className="surface overflow-hidden">
         <CardContent className="p-0">
           {loading ? (
             <div className="flex items-center justify-center py-20 text-slate-400 dark:text-slate-500">
@@ -387,21 +386,31 @@ function InvoicesList() {
               </Button>
             </div>
           ) : filteredInvoices.length === 0 ? (
-            <div className="text-center py-16 px-4">
-              <FileText className="h-12 w-12 mx-auto mb-3 text-slate-300 dark:text-slate-600" />
-              <p className="font-medium text-slate-700 dark:text-slate-200">
-                {debouncedSearch ? "No matching invoices" : "No invoices yet"}
-              </p>
-              <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">
-                {debouncedSearch
-                  ? "Try a different search term or clear the filter."
-                  : "Create your first invoice to get started."}
-              </p>
-              {!debouncedSearch && (
-                <Link href="/invoices/new" className="inline-block mt-4">
-                  <Button>Create Invoice</Button>
-                </Link>
-              )}
+            <div className="p-6">
+              <EmptyState
+                icon={<FileText className="h-7 w-7" strokeWidth={1.8} />}
+                title={debouncedSearch ? "No matching invoices" : "No invoices yet"}
+                description={
+                  debouncedSearch
+                    ? "Try a different search term or clear the filter to see more results."
+                    : "Create your first invoice to start getting paid. You can bill clients, track payments, and send reminders."
+                }
+                action={
+                  !debouncedSearch ? (
+                    <Link href="/invoices/new">
+                      <Button className="bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 shadow-lg shadow-blue-500/25">
+                        <Plus className="h-4 w-4 mr-2" />
+                        Create Invoice
+                      </Button>
+                    </Link>
+                  ) : (
+                    <Button variant="outline" onClick={() => setSearch("")}>
+                      <X className="h-4 w-4 mr-2" />
+                      Clear search
+                    </Button>
+                  )
+                }
+              />
             </div>
           ) : (
             <>

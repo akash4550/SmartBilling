@@ -16,6 +16,7 @@
  */
 import { NextResponse } from "next/server";
 import { processDueRecurringProfiles } from "@/lib/recurring";
+import { timingSafeEqual } from "@/lib/api-helpers";
 
 export const dynamic = "force-dynamic";
 
@@ -25,7 +26,7 @@ export async function GET(request: Request) {
     if (secret) {
       const auth = request.headers.get("authorization") ?? "";
       const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-      if (token !== secret) {
+      if (!token || !timingSafeEqual(token, secret)) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
       }
     }

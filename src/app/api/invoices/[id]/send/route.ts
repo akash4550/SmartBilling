@@ -5,6 +5,8 @@ import { getBrandingForUser } from "@/lib/branding";
 import { requireUser, unauthorized, jsonError, getPrismaErrorCode } from "@/lib/api-helpers";
 import { logActivity, clientIp } from "@/lib/activity";
 import { sendInvoiceEmail } from "@/lib/send-invoice-email";
+import { withTenant } from "@/lib/tenant";
+import { postLedgerEvent } from "@/lib/ledger";
 
 interface RouteParams {
   params: Promise<{ id: string }>;
@@ -97,13 +99,39 @@ export async function POST(request: Request, { params }: RouteParams) {
       return jsonError(`Failed to send email: ${result.error}`, 502);
     }
 
-    // Mark as sent: DRAFT → PENDING and stamp lastSentAt.
-    const updated = await prisma.invoice.updateMany({
-      where: { id, userId: user.id },
-      data: {
-        status: invoice.status === "DRAFT" ? "PENDING" : invoice.status,
-        lastSentAt: new Date(),
-      },
+    // Mark as sent: DRAFT → PENDING and stamp lastSentAt. Wrap in withTenant
+    // so the DRAFT→PENDING transition also posts an INVOICE_ISSUED ledger
+    // event atomically with the status update.
+    const wasDraft = invoice.status === "DRAFT";
+    const updated = await withTenant(user.id, async (tx) => {
+      const res = await tx.invoice.updateMany({
+        where: { id, userId: user.id },
+        data: {
+          status: wasDraft ? "PENDING" : invoice.status,
+          lastSentAt: new Date(),
+        },
+      });
+      if (res.count > 0 && wasDraft) {
+        await postLedgerEvent(
+          {
+            type: "INVOICE_ISSUED",
+            invoice: {
+              id: invoice.id,
+              userId: user.id,
+              items: invoice.items.map((it) => ({
+                description: it.description,
+                quantity: it.quantity,
+                price: Number(it.price),
+              })),
+              taxRate: Number(invoice.taxRate),
+              discountType: invoice.discountType,
+              discountValue: invoice.discountValue != null ? Number(invoice.discountValue) : null,
+            },
+          },
+          tx
+        );
+      }
+      return res;
     });
 
     if (updated.count > 0) {

@@ -24,6 +24,10 @@ model User {
   passwordHash      String
   resetToken        String?    @unique
   resetTokenExpires DateTime?
+  // Monotonic session version. Incremented on password change or "sign out
+  // everywhere" to revoke all outstanding JWTs (stateless JWT cannot otherwise
+  // be invalidated without a server-side check).
+  sessionVersion    Int        @default(0)
   createdAt         DateTime   @default(now())
   updatedAt         DateTime   @updatedAt
 
@@ -33,6 +37,12 @@ model User {
   expenses           Expense[]
   recurringProfiles  RecurringProfile[]
   activities         InvoiceActivity[]
+  // Tail pointer of the hash-chained ledger for this user. The newest
+  // LedgerEntry.rowHash must equal this; the ledger enforces it via the
+  // posting helper (SELECT ... FOR UPDATE on user row before insert).
+  lastLedgerEntryHash String?
+  lastLedgerEntryId   String?
+  ledgerEntries       LedgerEntry[]
 
   @@map("users")
 }
@@ -167,9 +177,14 @@ model Invoice {
   recurring RecurringProfile? @relation(fields: [recurringProfileId], references: [id], onDelete: SetNull)
   activities InvoiceActivity[]
 
-  @@index([userId])
   @@index([clientId])
   @@index([userId, status])
+  @@index([userId, createdAt])
+  @@index([userId, paidAt])
+  @@index([userId, dueDate])
+  @@index([userId, issueDate])
+  @@index([stripePaymentIntentId])
+  @@index([razorpayOrderId])
   @@map("invoices")
 }
 
@@ -178,6 +193,11 @@ model Invoice {
 // ============================================================
 model InvoiceItem {
   id          String  @id @default(cuid())
+  // Denormalized userId for RLS tenant isolation. Backfilled from Invoice
+  // on migration and always written explicitly when creating items. RLS
+  // policies cannot traverse the invoice FK in all Prisma query shapes, so
+  // we duplicate the tenant id directly on the child row.
+  userId      String
   invoiceId   String
   description String
   quantity    Int     @default(1)
@@ -187,6 +207,7 @@ model InvoiceItem {
   invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
 
   @@index([invoiceId])
+  @@index([userId])
   @@map("invoice_items")
 }
 
@@ -230,6 +251,7 @@ model RecurringProfile {
 
 model RecurringItem {
   id          String  @id @default(cuid())
+  userId      String
   profileId   String
   description String
   quantity    Int     @default(1)
@@ -238,6 +260,7 @@ model RecurringItem {
   profile RecurringProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
 
   @@index([profileId])
+  @@index([userId])
   @@map("recurring_items")
 }
 
@@ -300,6 +323,7 @@ enum InvoiceActivityType {
   VOIDED
   EMAIL_DELIVERED
   EMAIL_BOUNCED
+  EMAIL_COMPLAINED
   EMAIL_OPENED
 }
 
@@ -333,3 +357,178 @@ model Expense {
 }
 
 // Back-relation from User to Expense (add to User model below).
+
+// ============================================================
+// WEBHOOK INGESTION MODEL (ASYNC DECOUPLED QUEUE)
+// ============================================================
+// Staging table for webhook payloads. The thin edge handlers validate
+// the signature and INSERT the raw payload here (response <50ms), then
+// a decoupled cron worker (`/api/cron/process-webhooks`) claims rows
+// with SELECT ... FOR UPDATE SKIP LOCKED, processes them, and marks
+// them DONE or DLQ after 5 failed attempts with exponential backoff.
+//
+// Key properties:
+//  - Append-only: ROWS ARE NEVER UPDATED IN PLACE except for status
+//    transitions during worker processing (claim, done, retry, dlq).
+//  - Idempotency: unique (provider, providerEventId) allows INSERTs to
+//    no-op on duplicate Stripe/Razorpay/Resend event IDs.
+//  - Raw body is retained for 90 days for audit (purge via cron TTL
+//    sweep if needed).
+enum WebhookIngestionStatus {
+  // Inserted by edge handler; awaiting worker pickup.
+  PENDING
+  // Claimed by a worker (locked_at set, locked_by identifies the worker).
+  PROCESSING
+  // Successfully processed.
+  DONE
+  // Permanently failed after max attempts; routed to DLQ for manual review.
+  DLQ
+}
+
+model WebhookIngestion {
+  id              String                  @id @default(cuid())
+  // "stripe" | "razorpay" | "resend" — kept as plain String (not enum)
+  // so adding providers doesn't require a migration for trivial adapters.
+  provider        String
+  // Provider-side event ID (Stripe event.id, Razorpay event.id, Resend id).
+  // Used for idempotency — duplicate webhook retries from the provider
+  // will hit the unique constraint and be silently dropped (202 Accepted).
+  providerEventId String?
+  // Event type string (e.g., "checkout.session.completed", "payment.captured").
+  eventType       String
+  // Raw request body (unparsed text). Kept for 90 days for forensic audit.
+  rawBody         String                  @db.Text
+  // Stripe/Razorpay/Resend signature header at ingest time (for replay/audit).
+  signature       String?
+  // Delivery attempt counter; incremented on each failed processing run.
+  attempts        Int                     @default(0)
+  // Last error message surfaced by the handler (truncated to 2KB).
+  lastError       String?                 @db.Text
+  // Next eligible processing time (now + backoff). Backoff formula:
+  //   5s * 2^attempts + jitter(0..1000ms)
+  // PENDING/RETRY rows with nextAttemptAt <= now are eligible for claim.
+  nextAttemptAt   DateTime                @default(now())
+  // Status lifecycle: PENDING → PROCESSING → DONE (or → DLQ after 5 fails).
+  status          WebhookIngestionStatus  @default(PENDING)
+  // Worker identifier (process pid + hostname) while PROCESSING, for
+  // operator visibility / stuck-claim reaping.
+  lockedBy        String?
+  lockedAt        DateTime?
+  processedAt     DateTime?
+  createdAt       DateTime                @default(now())
+
+  @@unique([provider, providerEventId], name: "wh_ingest_provider_event_uniq")
+  @@index([status, nextAttemptAt], name: "wh_ingest_claim_idx")
+  @@index([createdAt], name: "wh_ingest_created_idx")
+  @@map("webhook_ingestions")
+}
+
+// ============================================================
+// IMMUTABLE DOUBLE-ENTRY FINANCIAL LEDGER
+// ============================================================
+// Every financial state change (invoice issued, payment received,
+// expense recorded, invoice voided) is recorded as a balanced set of
+// LedgerEntry rows: the sum of DEBIT amounts equals the sum of CREDIT
+// amounts for every eventId, enforced both at the application layer
+// (posting helpers) AND as a Postgres CONSTRAINT trigger (defense in
+// depth).
+//
+// The ledger is append-only: rows are NEVER updated or deleted. A VOID
+// is modeled as a reversing entry (mirror debits/credits of the
+// original issuance, plus a payment reversal if needed). A new
+// `lastLedgerEntryHash` tail pointer on `users` allows O(1) hash-chain
+// append; each entry's entryHash = SHA-256(prevEntryHash + canonical
+// serialization of this entry) so the chain is tamper-evident.
+//
+// The Invoice.status column becomes a READ PROJECTION over the ledger
+// (paid iff an INVOICE_PAID entry exists for the invoiceId; void iff a
+// VOID entry exists). We keep the column as a cached materialization
+// for query performance but the ledger is the source of truth.
+
+enum AccountType {
+  // Money owed to you (asset). Dr when invoice issued, Cr when paid.
+  ACCOUNTS_RECEIVABLE
+  // Sales income. Cr when invoice issued, Dr on void.
+  REVENUE
+  // Contra-revenue for discounts (debit balance, reduces net revenue).
+  // Explicitly tracked so revenue is gross and discount is separate
+  // rather than being buried in the REVENUE credit.
+  DISCOUNT_CONTRA
+  // Sales tax collected on behalf of the government (liability).
+  // Cr when invoice issued, Dr on void.
+  TAX_PAYABLE
+  // Cash/bank (asset). Dr when payment lands, Cr when expenses paid.
+  CASH
+  // Cost of doing business (expense). Dr when expense recorded.
+  EXPENSES
+}
+
+enum EntrySide {
+  DEBIT
+  CREDIT
+}
+
+enum LedgerEventType {
+  // Invoice issued (post-send or on PENDING create):
+  //   Dr ACCOUNTS_RECEIVABLE     total
+  //   Cr REVENUE                 netAmount (pre-tax)
+  //   Cr TAX_PAYABLE             taxAmount
+  INVOICE_ISSUED
+  // Payment received against an invoice:
+  //   Dr CASH                    amountReceived
+  //   Cr ACCOUNTS_RECEIVABLE     amountReceived
+  INVOICE_PAID
+  // Invoice voided — reverses the INVOICE_ISSUED entry exactly:
+  //   Dr REVENUE                 netAmount
+  //   Dr TAX_PAYABLE             taxAmount
+  //   Cr ACCOUNTS_RECEIVABLE     total
+  // (If the invoice was paid, we also reverse the payment entry below.)
+  INVOICE_VOIDED
+  // Payment reversal (e.g. chargeback / refund) — mirrors INVOICE_PAID:
+  //   Dr ACCOUNTS_RECEIVABLE     amount
+  //   Cr CASH                    amount
+  PAYMENT_REVERSED
+  // Business expense recorded (cash basis):
+  //   Dr EXPENSES                amount
+  //   Cr CASH                    amount
+  EXPENSE_RECORDED
+}
+
+model LedgerEntry {
+  id          String         @id @default(cuid())
+  // Per-user hash chain; entries for different tenants never mix.
+  userId      String
+  // All rows that make up one balanced transaction share the same eventId
+  // (a CUID allocated by the posting helper).
+  eventId     String
+  eventType   LedgerEventType
+  account     AccountType
+  side        EntrySide
+  // Amount in integer SUBUNITS (paise for INR). Always positive — DEBIT
+  // vs CREDIT is determined by the `side` column. Signed arithmetic is
+  // avoided to prevent accidental sign-flip bugs.
+  amountPaise BigInt
+  // Hash chain pointer. SHA-256 of (prevEntryHash || canonical entry bytes).
+  // The very first entry for a user has prevEntryHash = GENESIS (a constant).
+  prevEntryHash String
+  entryHash     String
+  entryIndex    Int // 1-based position in the user's ledger (strictly increasing)
+  // Links back to the source entity for audit. Exactly one of invoiceId
+  // or expenseId is set for most events (VOID events may reference invoice).
+  invoiceId   String?
+  expenseId   String?
+  // Optional memo/currency metadata.
+  currency    String         @default("INR")
+  note        String?        @db.Text
+  createdAt   DateTime       @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([userId, eventId])
+  @@index([invoiceId])
+  @@index([expenseId])
+  @@unique([userId, entryIndex])
+  @@unique([userId, entryHash])
+  @@map("ledger_entries")
+}

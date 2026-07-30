@@ -2,9 +2,7 @@ import { NextResponse } from "next/server";
 import { ZodError } from "zod";
 import { prisma } from "@/lib/prisma";
 import { invoiceSchema } from "@/lib/validations";
-import {
-  calculateInvoiceTotals,
-} from "@/lib/utils";
+import { calculateInvoiceTotals } from "@/lib/utils";
 import {
   validationErrorResponse,
   jsonError,
@@ -14,7 +12,9 @@ import {
 } from "@/lib/api-helpers";
 import { logActivity, clientIp } from "@/lib/activity";
 import { rateLimit, requestKey } from "@/lib/rate-limit";
-import { markInvoicePaid } from "@/lib/invoice-helpers";
+import { markInvoicePaid, voidInvoice } from "@/lib/invoice-helpers";
+import { withTenant } from "@/lib/tenant";
+import { postLedgerEvent } from "@/lib/ledger";
 import { z } from "zod";
 
 interface RouteParams {
@@ -86,9 +86,6 @@ export async function GET(request: Request, { params }: RouteParams) {
     if (!recentView) {
       logActivity({
         invoiceId: id,
-        // Public views attribute to the invoice owner so they appear in the
-        // admin timeline (the client isn't authenticated, so we can't look
-        // them up as a User).
         userId: invoice.userId,
         type: "VIEWED",
         message: `Invoice viewed by client${ip ? ` (${maskIp(ip)})` : ""}`,
@@ -110,14 +107,14 @@ export async function GET(request: Request, { params }: RouteParams) {
  * PATCH /api/invoices/:id
  *
  * Supports two shapes:
- *   1. { status: "DRAFT"|"PENDING"|"PAID" }  — lightweight status update
+ *   1. { status: "DRAFT"|"PENDING"|"PAID"|"VOID" }  — lightweight status update
  *      (used by Mark-as-Paid).
  *   2. Full invoice payload (clientId, issueDate, dueDate, taxRate, notes,
  *      items) — used by the Edit Invoice form. Line items are replaced:
  *      items present in the payload are upserted by id (if they match an
- *      existing item on this invoice), newly generated ids are created,
- *      and items that were removed in the form are deleted. Totals are
- *      recomputed server-side.
+ *      existing item on THIS invoice — see C5 hardening below), newly
+ *      generated ids are created, and items that were removed in the form
+ *      are deleted. Totals are recomputed server-side.
  *
  * Must own the invoice.
  */
@@ -128,7 +125,7 @@ export async function PATCH(request: Request, { params }: RouteParams) {
 
     const { id } = await params;
 
-    // 🔒 Ownership check (load items for full-update replacement logic)
+    // Ownership check (load items for full-update replacement logic).
     const existing = await prisma.invoice.findFirst({
       where: { id, userId: user.id },
       include: { items: true },
@@ -145,44 +142,123 @@ export async function PATCH(request: Request, { params }: RouteParams) {
 
     if (isStatusOnly) {
       const validated = statusOnlySchema.parse(body);
-      if (validated.status === "PAID" && existing.status !== "PAID") {
-        // Use shared helper → sets paidAt, logs activity, sends receipt email.
+      // Cast to the full union to prevent TS from narrowing based on the
+      // early-return branches below.
+      const targetStatus = validated.status as "DRAFT" | "PENDING" | "PAID" | "VOID";
+
+      if (targetStatus === "VOID") {
+        // VOID: atomic status update + reversing ledger entries (issuance
+        // reversed; payment reversed if PAID). voidInvoice is idempotent.
+        const invoice = await voidInvoice(id, { actorUserId: user.id, ip: clientIp(request) });
+        if (!invoice) return jsonError("Invoice not found", 404);
+        // Reload with client for response.
+        const reloaded = await prisma.invoice.findUnique({
+          where: { id },
+          include: { client: true, items: true },
+        });
+        return NextResponse.json(reloaded ?? invoice, { status: 200 });
+      }
+
+      if (targetStatus === "PAID" && existing.status !== "PAID") {
+        // Shared atomic helper (already uses withTenant internally).
         const invoice = await markInvoicePaid(id, {
           provider: "manual",
           actorUserId: user.id,
           ip: clientIp(request),
         });
-        if (!invoice) return jsonError("Invoice not found", 404);
-        // Reload with relations for the response.
+        if (!invoice) {
+          const reloaded = await prisma.invoice.findUnique({
+            where: { id },
+            include: { client: true, items: true },
+          });
+          if (reloaded) return NextResponse.json(reloaded, { status: 200 });
+          return jsonError("Invoice not found", 404);
+        }
         const reloaded = await prisma.invoice.findUnique({
           where: { id },
           include: { client: true, items: true },
         });
         return NextResponse.json(reloaded, { status: 200 });
       }
-      // Other status transitions (e.g. PAID → PENDING, PENDING → DRAFT, any → VOID).
+
+      // Other status transitions (DRAFT/PENDING transitions; PAID is a
+      // no-op if already PAID) — wrapped in withTenant for RLS.
       const now = new Date();
+      const leavingPaid = existing.status === "PAID" && targetStatus !== "PAID";
+      const becomingPaid = targetStatus === "PAID" && existing.status !== "PAID";
+      const issuingFromDraft =
+        existing.status === "DRAFT" &&
+        (targetStatus === "PENDING" || targetStatus === "PAID");
+
       const updateData: {
         status: "DRAFT" | "PENDING" | "PAID" | "VOID";
         paidAt?: Date | null;
-      } = { status: validated.status };
-      if (validated.status !== "PAID" && existing.status === "PAID") {
+      } = { status: targetStatus };
+      if (targetStatus !== "PAID" && existing.status === "PAID") {
         updateData.paidAt = null;
-      } else if (validated.status === "PAID") {
+      } else if (becomingPaid) {
         updateData.paidAt = now;
       }
-      const invoice = await prisma.invoice.update({
-        where: { id },
-        data: updateData,
-        include: { client: true, items: true },
+
+      const invoice = await withTenant(user.id, async (tx) => {
+        const updated = await tx.invoice.update({
+          where: { id },
+          data: updateData,
+          include: { client: true, items: true },
+        });
+
+        if (issuingFromDraft) {
+          await postLedgerEvent(
+            {
+              type: "INVOICE_ISSUED",
+              invoice: {
+                id: updated.id,
+                userId: updated.userId,
+                items: existing.items.map((i) => ({
+                  description: i.description,
+                  quantity: i.quantity,
+                  price: Number(i.price),
+                })),
+                taxRate: Number(updated.taxRate),
+                discountType: existing.discountType,
+                discountValue: existing.discountValue != null ? Number(existing.discountValue) : null,
+              },
+            },
+            tx
+          );
+        }
+
+        if (becomingPaid) {
+          await postLedgerEvent(
+            {
+              type: "INVOICE_PAID",
+              invoice: { id: updated.id, userId: updated.userId, totalAmount: updated.totalAmount },
+              amountPaid: updated.totalAmount,
+            },
+            tx
+          );
+        }
+
+        if (leavingPaid) {
+          // PAID → PENDING/DRAFT: reverse the payment.
+          await postLedgerEvent(
+            {
+              type: "PAYMENT_REVERSED",
+              invoice: { id: updated.id, userId: updated.userId },
+              amount: existing.totalAmount,
+              note: "Payment unmarked via status change",
+            },
+            tx
+          );
+        }
+
+        return updated;
       });
       logActivity({
         invoiceId: id,
         userId: user.id,
-        type: validated.status === "VOID" ? "VOIDED" : "EDITED",
-        message: validated.status === "VOID"
-          ? "Invoice voided (cancelled without payment)"
-          : `Status changed to ${validated.status}`,
+        type: "EDITED",
+        message: `Status changed to ${targetStatus}`,
         ip: clientIp(request),
       });
       return NextResponse.json(invoice, { status: 200 });
@@ -191,7 +267,7 @@ export async function PATCH(request: Request, { params }: RouteParams) {
     // ---------- Full update ----------
     const validated = fullUpdateSchema.parse(body);
 
-    // 🔒 Verify the (possibly changed) client still belongs to this user.
+    // Verify the (possibly changed) client still belongs to this user.
     const client = await prisma.client.findFirst({
       where: { id: validated.clientId, userId: user.id },
     });
@@ -202,33 +278,42 @@ export async function PATCH(request: Request, { params }: RouteParams) {
       validated.taxRate,
       validated.discountType
         ? { type: validated.discountType, value: validated.discountValue ?? 0 }
-        : {},
+        : {}
     );
 
-    // Replace line items: diff incoming items vs existing.
-    // Incoming items may carry either (a) a known existing id (edit), or
-    // (b) a client-generated placeholder id (new item). We upsert known ids
-    // and create new ones; then delete any existing ids not present in the
-    // payload.
+    // ---- C5 hardening: line-item ids must belong to THIS invoice ----
+    //
+    // Zod strips unknown keys, so incoming item `id` values aren't present
+    // on `validated.items`. We re-extract from the raw body and WHITELIST
+    // them: an id is only accepted for upsert if it refers to an existing
+    // line item on the invoice being edited. Any other id (cross-tenant,
+    // non-existent, or from a different invoice owned by the same user) is
+    // discarded and treated as a new item (server will issue a fresh CUID).
+    // As defense-in-depth, every tx.invoiceItem.update below additionally
+    // scopes the WHERE clause to `{ id, invoiceId }` so a slipped id cannot
+    // mutate rows outside this invoice.
     const existingById = new Map(existing.items.map((it) => [it.id, it]));
     const keepIds = new Set<string>();
     const itemsData = validated.items.map((it, idx) => {
       const lineTotal =
         Math.round((it.quantity * it.price + Number.EPSILON) * 100) / 100;
-      // Zod strips unknown keys unless we allow them, so incoming item `id`
-      // values aren't on the validated output. We re-extract defensively from
-      // the raw body items list so edits can upsert existing rows.
-      const rawItem = Array.isArray(body?.items) ? (body.items[idx] as unknown) : null;
+
+      const rawItem = Array.isArray(body?.items)
+        ? (body.items[idx] as unknown)
+        : null;
       const candidateId =
         rawItem &&
         typeof rawItem === "object" &&
         "id" in rawItem &&
         typeof (rawItem as { id?: unknown }).id === "string"
-          ? (rawItem as { id: string }).id
+          ? ((rawItem as { id: string }).id as string)
           : undefined;
+
+      // Whitelist: only accept ids that exist on THIS invoice.
       const existingId =
         candidateId && existingById.has(candidateId) ? candidateId : undefined;
       if (existingId) keepIds.add(existingId);
+
       return {
         ...(existingId ? { id: existingId } : {}),
         description: it.description,
@@ -242,28 +327,50 @@ export async function PATCH(request: Request, { params }: RouteParams) {
       .filter((it) => !keepIds.has(it.id))
       .map((it) => it.id);
 
-    // If the user is moving AWAY from PAID (e.g. editing totals), clear paidAt.
-    // If they're moving TO PAID (including staying paid), preserve/set paidAt.
+    // Status transition ledger rules for full-edit PATCH:
+    //   DRAFT → PENDING/PAID : issue INVOICE_ISSUED (first time it's sent out)
+    //   *     → PAID         : post INVOICE_PAID (mark paid)
+    //   PAID  → non-PAID     : post PAYMENT_REVERSED (un-pay / refund)
+    //   *     → VOID         : post INVOICE_VOIDED (reverses issuance + payment)
+    // Editing line items/totals on an already-issued (PENDING/PAID) invoice
+    // without a status change is not back-propagated to the ledger — the
+    // ledger is append-only. To correct a financial amount, void + reissue.
     const now = new Date();
-    let paidAtValue: Date | null | undefined = undefined;
-    if (validated.status === "PAID" && existing.status !== "PAID") {
-      paidAtValue = now;
-    } else if (validated.status !== "PAID" && existing.status === "PAID") {
-      paidAtValue = null;
-    }
+    const prevStatus = existing.status as "DRAFT" | "PENDING" | "PAID" | "VOID";
+    const newStatus = validated.status as "DRAFT" | "PENDING" | "PAID" | "VOID";
+    const becomingVoid = newStatus === "VOID" && prevStatus !== "VOID";
+    const becomingPaid = newStatus === "PAID" && prevStatus !== "PAID";
+    // void handles its own payment reversal; leavingPaid is PAID → non-PAID non-VOID:
+    const leavingPaid =
+      newStatus !== "PAID" && newStatus !== "VOID" && prevStatus === "PAID";
+    const issuingFromDraft =
+      prevStatus === "DRAFT" && (newStatus === "PENDING" || newStatus === "PAID");
 
-    const invoice = await prisma.$transaction(async (tx) => {
+    let paidAtValue: Date | null | undefined = undefined;
+    if (becomingPaid) paidAtValue = now;
+    else if (newStatus !== "PAID" && prevStatus === "PAID") paidAtValue = null;
+
+    // Build the post-update items snapshot for INVOICE_ISSUED posting. If
+    // issuing from draft we use the newly-validated items; for VOID we use
+    // the original items (since void reverses the original issuance).
+    const newItems = validated.items.map((it) => ({
+      description: it.description,
+      quantity: it.quantity,
+      price: it.price,
+    }));
+
+    // Full-update tx runs inside withTenant for RLS enforcement.
+    const invoice = await withTenant(user.id, async (tx) => {
       if (deleteIds.length > 0) {
         await tx.invoiceItem.deleteMany({
           where: { id: { in: deleteIds }, invoiceId: id },
         });
       }
 
-      // Upsert each incoming item.
       for (const it of itemsData) {
         if (it.id) {
           await tx.invoiceItem.update({
-            where: { id: it.id },
+            where: { id: it.id, invoiceId: id },
             data: {
               description: it.description,
               quantity: it.quantity,
@@ -274,6 +381,7 @@ export async function PATCH(request: Request, { params }: RouteParams) {
         } else {
           await tx.invoiceItem.create({
             data: {
+              userId: user.id,
               invoiceId: id,
               description: it.description,
               quantity: it.quantity,
@@ -284,48 +392,146 @@ export async function PATCH(request: Request, { params }: RouteParams) {
         }
       }
 
-      return tx.invoice.update({
+      // When the target is VOID, we update status to VOID (clearing paidAt)
+      // and post INVOICE_VOIDED which reverses issuance + any payment.
+      const updated = await tx.invoice.update({
         where: { id },
         data: {
           clientId: validated.clientId,
-          status: validated.status,
+          status: newStatus,
           issueDate: new Date(validated.issueDate),
           dueDate: new Date(validated.dueDate),
           subtotal,
           discountType: validated.discountType ?? null,
-          discountValue: validated.discountType && validated.discountValue != null
-            ? validated.discountValue
-            : null,
+          discountValue:
+            validated.discountType && validated.discountValue != null
+              ? validated.discountValue
+              : null,
           discountAmount,
           taxRate: validated.taxRate,
-          taxLabel: (validated.taxLabel && validated.taxLabel.trim()) || existing.taxLabel || "GST",
+          taxLabel:
+            (validated.taxLabel && validated.taxLabel.trim()) ||
+            existing.taxLabel ||
+            "GST",
           totalAmount: total,
           notes: validated.notes ?? null,
-          ...(paidAtValue === undefined ? {} : { paidAt: paidAtValue }),
+          ...(newStatus === "VOID"
+            ? { paidAt: null, stripeCheckoutSessionId: null }
+            : paidAtValue === undefined
+            ? {}
+            : { paidAt: paidAtValue }),
         },
         include: { client: true, items: { orderBy: { id: "asc" } } },
       });
+
+      // --- Ledger postings (all inside this tx; failures roll back). ---
+      if (issuingFromDraft) {
+        await postLedgerEvent(
+          {
+            type: "INVOICE_ISSUED",
+            invoice: {
+              id: updated.id,
+              userId: user.id,
+              items: newItems,
+              taxRate: validated.taxRate,
+              discountType: validated.discountType,
+              discountValue: validated.discountValue ?? null,
+            },
+          },
+          tx
+        );
+      }
+
+      if (becomingPaid && !issuingFromDraft) {
+        // Was already issued (PENDING/VOID→PAID shouldn't happen from VOID
+        // but guard anyway); post just the payment side.
+        await postLedgerEvent(
+          {
+            type: "INVOICE_PAID",
+            invoice: { id: updated.id, userId: user.id, totalAmount: updated.totalAmount },
+            amountPaid: updated.totalAmount,
+          },
+          tx
+        );
+      } else if (becomingPaid && issuingFromDraft) {
+        // After INVOICE_ISSUED, also post INVOICE_PAID for PAID create/save.
+        await postLedgerEvent(
+          {
+            type: "INVOICE_PAID",
+            invoice: { id: updated.id, userId: user.id, totalAmount: updated.totalAmount },
+            amountPaid: updated.totalAmount,
+          },
+          tx
+        );
+      }
+
+      if (leavingPaid) {
+        // PAID → PENDING/DRAFT: reverse the payment ledger entry.
+        await postLedgerEvent(
+          {
+            type: "PAYMENT_REVERSED",
+            invoice: { id: updated.id, userId: user.id },
+            amount: existing.totalAmount,
+            note: "Payment unmarked via invoice edit",
+          },
+          tx
+        );
+      }
+
+      if (becomingVoid) {
+        // Reversing issuance uses the *new* (edited) items/totals since
+        // that's what was sitting in AR. If the invoice was PAID going into
+        // the edit, also reverse the payment.
+        await postLedgerEvent(
+          {
+            type: "INVOICE_VOIDED",
+            invoice: {
+              id: updated.id,
+              userId: user.id,
+              items: newItems,
+              taxRate: validated.taxRate,
+              discountType: validated.discountType,
+              discountValue: validated.discountValue ?? null,
+              paidAmount: prevStatus === "PAID" ? existing.totalAmount : null,
+            },
+          },
+          tx
+        );
+      }
+
+      return updated;
     });
 
-    // Activity event: detect what changed (status transition, details edit).
+    // Activity event: detect what changed.
     const changedParts: string[] = [];
     if (existing.status !== invoice.status) {
-      if (invoice.status === "PAID") changedParts.push(`status → Paid (${Intl.NumberFormat("en-IN", { style: "currency", currency: "INR" }).format(Number(invoice.totalAmount))})`);
-      else changedParts.push(`status → ${invoice.status}`);
+      if (invoice.status === "PAID") {
+        changedParts.push(
+          `status → Paid (${new Intl.NumberFormat("en-IN", {
+            style: "currency",
+            currency: "INR",
+          }).format(Number(invoice.totalAmount))})`
+        );
+      } else {
+        changedParts.push(`status → ${invoice.status}`);
+      }
     }
     if (
       existing.clientId !== invoice.clientId ||
       Number(existing.taxRate) !== Number(invoice.taxRate) ||
       existing.notes !== invoice.notes ||
       deleteIds.length > 0 ||
-      itemsData.some((it) => !it.id) // any newly added item
+      itemsData.some((it) => !it.id)
     ) {
       changedParts.push("details edited");
     }
     logActivity({
       invoiceId: id,
       userId: user.id,
-      type: invoice.status === "PAID" && existing.status !== "PAID" ? "MARKED_PAID" : "EDITED",
+      type:
+        invoice.status === "PAID" && existing.status !== "PAID"
+          ? "MARKED_PAID"
+          : "EDITED",
       message: changedParts.length
         ? `Invoice updated — ${changedParts.join(", ")}`
         : "Invoice updated",
@@ -335,9 +541,18 @@ export async function PATCH(request: Request, { params }: RouteParams) {
     return NextResponse.json(invoice, { status: 200 });
   } catch (error) {
     if (error instanceof ZodError) return validationErrorResponse(error);
-    if (error instanceof SyntaxError) return jsonError("Invalid JSON payload", 400);
-    if (getPrismaErrorCode(error) === "P2025" || getPrismaErrorCode(error) === "P2016") {
-      return jsonError("Invoice not found", 404);
+    if (error instanceof SyntaxError)
+      return jsonError("Invalid JSON payload", 400);
+    if (
+      getPrismaErrorCode(error) === "P2025" ||
+      getPrismaErrorCode(error) === "P2016"
+    ) {
+      // P2025 from the tx.invoiceItem.update means an id failed the
+      // invoiceId scoping check → treat as validation/auth failure.
+      console.warn(
+        "[PATCH /api/invoices/:id] Record not found — possible attempted cross-invoice item mutation"
+      );
+      return jsonError("Invoice or line item not found", 404);
     }
     console.error("[PATCH /api/invoices/:id] Failed:", error);
     return jsonError("Failed to update invoice", 500);
@@ -359,10 +574,16 @@ export async function DELETE(_request: Request, { params }: RouteParams) {
     });
     if (!existing) return jsonError("Invoice not found", 404);
 
-    await prisma.invoice.delete({ where: { id } });
-    return NextResponse.json({ success: true, message: "Invoice deleted" }, { status: 200 });
+    await withTenant(user.id, (tx) => tx.invoice.delete({ where: { id } }));
+    return NextResponse.json(
+      { success: true, message: "Invoice deleted" },
+      { status: 200 }
+    );
   } catch (error) {
-    if (getPrismaErrorCode(error) === "P2025" || getPrismaErrorCode(error) === "P2016") {
+    if (
+      getPrismaErrorCode(error) === "P2025" ||
+      getPrismaErrorCode(error) === "P2016"
+    ) {
       return jsonError("Invoice not found", 404);
     }
     console.error("[DELETE /api/invoices/:id] Failed:", error);
@@ -370,10 +591,7 @@ export async function DELETE(_request: Request, { params }: RouteParams) {
   }
 }
 
-
-
 function maskIp(ip: string): string {
-  // Truncate the last octet for privacy in UI (e.g. 192.168.1.xxx).
   if (ip.includes(".")) {
     const parts = ip.split(".");
     parts[parts.length - 1] = "xxx";

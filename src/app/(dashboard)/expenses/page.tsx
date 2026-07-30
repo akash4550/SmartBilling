@@ -9,12 +9,19 @@ import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
-import { ArrowLeft, Plus, Save, Trash2, Pencil, X, Loader2, TrendingDown, Receipt, Filter } from "lucide-react";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription } from "@/components/ui/dialog";
+import {
+  Plus, Save, Trash2, Pencil, X, Loader2, TrendingDown, Receipt,
+  Filter, Search, Download, Wallet, PieChart as PieIcon,
+} from "lucide-react";
 import { DEFAULT_EXPENSE_CATEGORIES, type ExpenseInput } from "@/lib/validations";
 import { formatMoney } from "@/lib/format-money";
 import { formatDate } from "@/lib/utils";
 import { toast } from "sonner";
 import { ImportExpensesButton } from "@/components/expenses/import-expenses-button";
+import { PageHeader } from "@/components/ui/page-header";
+import { EmptyState } from "@/components/ui/empty-state";
+import { PageTransition } from "@/components/page-transition";
 
 function csvEscape(v: string | number): string {
   const s = String(v ?? "");
@@ -43,6 +50,7 @@ function exportExpensesCsv(rows: Expense[], currency: string) {
   URL.revokeObjectURL(url);
   toast.success(`Exported ${rows.length} expense${rows.length === 1 ? "" : "s"} as CSV`, { description: currency });
 }
+
 interface Expense {
   id: string;
   date: string;
@@ -56,18 +64,61 @@ function toLocalISODate(d: Date): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
-const CATEGORY_COLORS: Record<string, string> = {
-  "Software & SaaS": "bg-blue-100 text-blue-700 dark:bg-blue-950/50 dark:text-blue-300",
-  Marketing: "bg-pink-100 text-pink-700 dark:bg-pink-950/50 dark:text-pink-300",
-  Travel: "bg-amber-100 text-amber-700 dark:bg-amber-950/50 dark:text-amber-300",
-  Materials: "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-300",
-  Contractors: "bg-violet-100 text-violet-700 dark:bg-violet-950/50 dark:text-violet-300",
-  Office: "bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300",
-  "Legal & Accounting": "bg-indigo-100 text-indigo-700 dark:bg-indigo-950/50 dark:text-indigo-300",
-  Taxes: "bg-red-100 text-red-700 dark:bg-red-950/50 dark:text-red-300",
-  "Bank Fees": "bg-orange-100 text-orange-700 dark:bg-orange-950/50 dark:text-orange-300",
-  General: "bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300",
+const CATEGORY_COLORS: Record<string, { pill: string; dot: string }> = {
+  "Software & SaaS": { pill: "bg-blue-100 text-blue-700 dark:bg-blue-950/50 dark:text-blue-300", dot: "#3b82f6" },
+  Marketing: { pill: "bg-pink-100 text-pink-700 dark:bg-pink-950/50 dark:text-pink-300", dot: "#ec4899" },
+  Travel: { pill: "bg-amber-100 text-amber-700 dark:bg-amber-950/50 dark:text-amber-300", dot: "#f59e0b" },
+  Materials: { pill: "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-300", dot: "#10b981" },
+  Contractors: { pill: "bg-violet-100 text-violet-700 dark:bg-violet-950/50 dark:text-violet-300", dot: "#8b5cf6" },
+  Office: { pill: "bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300", dot: "#64748b" },
+  "Legal & Accounting": { pill: "bg-indigo-100 text-indigo-700 dark:bg-indigo-950/50 dark:text-indigo-300", dot: "#6366f1" },
+  Taxes: { pill: "bg-red-100 text-red-700 dark:bg-red-950/50 dark:text-red-300", dot: "#ef4444" },
+  "Bank Fees": { pill: "bg-orange-100 text-orange-700 dark:bg-orange-950/50 dark:text-orange-300", dot: "#f97316" },
+  General: { pill: "bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300", dot: "#64748b" },
 };
+function catStyle(name: string) {
+  return CATEGORY_COLORS[name] ?? CATEGORY_COLORS.General;
+}
+
+// ---------------------------------------------------------------------------
+// KPI mini-card
+// ---------------------------------------------------------------------------
+function KpiCard({
+  icon: Icon,
+  label,
+  value,
+  iconBg,
+  iconColor,
+  valueColor = "text-slate-900 dark:text-white",
+  children,
+}: {
+  icon: typeof TrendingDown;
+  label: string;
+  value: React.ReactNode;
+  iconBg: string;
+  iconColor: string;
+  valueColor?: string;
+  children?: React.ReactNode;
+}) {
+  return (
+    <Card className="surface overflow-hidden">
+      <CardContent className="p-5 flex items-start gap-3">
+        <div className={`p-2.5 rounded-xl ${iconBg} shrink-0`}>
+          <Icon className={`h-5 w-5 ${iconColor}`} strokeWidth={2.2} />
+        </div>
+        <div className="flex-1 min-w-0">
+          <p className="text-[11px] font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wide">
+            {label}
+          </p>
+          <p className={`text-xl sm:text-2xl font-bold tabular-nums mt-0.5 leading-tight ${valueColor}`}>
+            {value}
+          </p>
+          {children}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
 
 export default function ExpensesPage() {
   const [expenses, setExpenses] = useState<Expense[] | null>(null);
@@ -145,13 +196,11 @@ export default function ExpensesPage() {
       }
       byCategory.set(e.category, (byCategory.get(e.category) ?? 0) + amt);
     }
-    return {
-      monthTotal,
-      allTotal,
-      byCategory: Array.from(byCategory.entries())
-        .map(([name, amount]) => ({ name, amount }))
-        .sort((a, b) => b.amount - a.amount),
-    };
+    const sortedCats = Array.from(byCategory.entries())
+      .map(([name, amount]) => ({ name, amount, ...catStyle(name) }))
+      .sort((a, b) => b.amount - a.amount);
+    const maxCat = sortedCats[0]?.amount ?? 0;
+    return { monthTotal, allTotal, byCategory: sortedCats, maxCat };
   }, [filtered]);
 
   function openNew() {
@@ -215,91 +264,91 @@ export default function ExpensesPage() {
   }
 
   return (
-    <div className="space-y-6 max-w-5xl mx-auto">
-      <div className="flex items-center justify-between flex-wrap gap-3">
-        <div className="flex items-center gap-3">
-          <Link href="/dashboard">
-            <Button variant="ghost" size="icon" className="rounded-full">
-              <ArrowLeft className="h-5 w-5" />
-            </Button>
-          </Link>
-          <div>
-            <h1 className="text-2xl sm:text-3xl font-bold tracking-tight">Expenses</h1>
-            <p className="text-slate-500 dark:text-slate-400 text-sm mt-0.5">
-              Track business costs and see your profit picture.
+    <PageTransition className="space-y-6 max-w-6xl mx-auto">
+      <PageHeader
+        title="Expenses"
+        description="Track business costs and see your profit picture at a glance."
+        icon={<Receipt className="h-5 w-5" strokeWidth={2.2} />}
+        iconGradient="from-rose-500 to-orange-600"
+      >
+        <Button
+          variant="outline"
+          onClick={() => exportExpensesCsv(filtered, currency)}
+          disabled={!filtered.length}
+          className="bg-white/70 dark:bg-slate-900/60"
+        >
+          <Download className="h-4 w-4 mr-2" />
+          Export
+        </Button>
+        <ImportExpensesButton onImported={load} />
+        <Button onClick={openNew} className="bg-gradient-to-r from-rose-500 to-orange-600 hover:from-rose-600 hover:to-orange-700 shadow-lg shadow-rose-500/25">
+          <Plus className="h-4 w-4 mr-2" />
+          Add Expense
+        </Button>
+      </PageHeader>
+
+      {/* KPI row */}
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <KpiCard
+          icon={TrendingDown}
+          label="This Month"
+          value={loading ? "…" : formatMoney(totals.monthTotal, currency)}
+          iconBg="bg-rose-100 dark:bg-rose-950/50"
+          iconColor="text-rose-600 dark:text-rose-400"
+          valueColor="text-rose-700 dark:text-rose-400"
+        />
+        <KpiCard
+          icon={Wallet}
+          label={categoryFilter === "ALL" ? "Total Spent" : "Filtered Total"}
+          value={loading ? "…" : formatMoney(totals.allTotal, currency)}
+          iconBg="bg-slate-100 dark:bg-slate-800"
+          iconColor="text-slate-700 dark:text-slate-300"
+        />
+        <KpiCard
+          icon={PieIcon}
+          label="Top Category"
+          value={totals.byCategory[0]?.name ?? "—"}
+          iconBg="bg-violet-100 dark:bg-violet-950/50"
+          iconColor="text-violet-600 dark:text-violet-400"
+          valueColor="text-slate-900 dark:text-white"
+        >
+          {totals.byCategory[0] && (
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5 tabular-nums">
+              {formatMoney(totals.byCategory[0].amount, currency)}
             </p>
-          </div>
-        </div>
-        <div className="flex gap-2 flex-wrap items-center">
-          <ImportExpensesButton onImported={load} />
-          <Button
-            variant="outline"
-            onClick={() => exportExpensesCsv(filtered, currency)}
-            disabled={!filtered.length}
-          >
-            Export CSV
-          </Button>
-          <Button onClick={openNew} className="bg-gradient-to-r from-rose-600 to-orange-600 hover:from-rose-700 hover:to-orange-700 shadow-lg shadow-rose-500/20">
-            <Plus className="h-4 w-4 mr-2" /> Add Expense
-          </Button>
-        </div>
+          )}
+        </KpiCard>
+        <KpiCard
+          icon={Receipt}
+          label="Entries"
+          value={loading ? "…" : filtered.length.toLocaleString("en-IN")}
+          iconBg="bg-blue-100 dark:bg-blue-950/50"
+          iconColor="text-blue-600 dark:text-blue-400"
+          valueColor="text-slate-900 dark:text-white"
+        >
+          <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+            {categoryFilter === "ALL" ? "All categories" : categoryFilter}
+          </p>
+        </KpiCard>
       </div>
 
-      <div className="grid gap-4 sm:grid-cols-3">
-        <Card>
-          <CardContent className="pt-6 flex items-center gap-3">
-            <div className="h-10 w-10 rounded-xl bg-rose-100 dark:bg-rose-950/50 flex items-center justify-center">
-              <TrendingDown className="h-5 w-5 text-rose-600 dark:text-rose-400" />
-            </div>
-            <div>
-              <p className="text-xs text-slate-500 uppercase tracking-wide font-semibold">This month</p>
-              <p className="text-xl font-bold text-rose-700 dark:text-rose-300 tabular-nums">
-                {loading ? "…" : formatMoney(totals.monthTotal, currency)}
-              </p>
-            </div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="pt-6 flex items-center gap-3">
-            <div className="h-10 w-10 rounded-xl bg-slate-100 dark:bg-slate-800 flex items-center justify-center">
-              <Receipt className="h-5 w-5 text-slate-600 dark:text-slate-300" />
-            </div>
-            <div>
-              <p className="text-xs text-slate-500 uppercase tracking-wide font-semibold">Total (filtered)</p>
-              <p className="text-xl font-bold text-slate-900 dark:text-white tabular-nums">
-                {loading ? "…" : formatMoney(totals.allTotal, currency)}
-              </p>
-            </div>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="pt-6">
-            <p className="text-xs text-slate-500 uppercase tracking-wide font-semibold mb-2">Top categories</p>
-            <div className="space-y-1 max-h-16 overflow-hidden">
-              {totals.byCategory.slice(0, 3).map((c) => (
-                <div key={c.name} className="flex items-center justify-between text-xs">
-                  <span className="text-slate-600 dark:text-slate-400 truncate">{c.name}</span>
-                  <span className="font-semibold tabular-nums">{formatMoney(c.amount, currency)}</span>
-                </div>
-              ))}
-              {totals.byCategory.length === 0 && <p className="text-xs text-slate-400">No expenses yet</p>}
-            </div>
-          </CardContent>
-        </Card>
-      </div>
-
-      <Card>
+      {/* Filters + list */}
+      <Card className="surface overflow-hidden">
         <CardHeader className="border-b border-slate-100 dark:border-slate-800 flex flex-row items-center justify-between gap-2 flex-wrap pb-3">
-          <CardTitle className="text-base flex items-center gap-2">
-            <Filter className="h-4 w-4" /> All Expenses
+          <CardTitle className="text-base flex items-center gap-2 text-slate-900 dark:text-white">
+            <Filter className="h-4 w-4 text-slate-400" />
+            All Expenses
           </CardTitle>
           <div className="flex items-center gap-2 flex-wrap">
-            <Input
-              placeholder="Search expenses…"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              className="h-9 w-48 text-sm"
-            />
+            <div className="relative">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
+              <Input
+                placeholder="Search expenses..."
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                className="h-9 w-48 sm:w-56 text-sm pl-9"
+              />
+            </div>
             <Select
               value={categoryFilter}
               onChange={(e) => setCategoryFilter(e.target.value)}
@@ -312,97 +361,178 @@ export default function ExpensesPage() {
         </CardHeader>
         <CardContent className="p-0">
           {loading ? (
-            <div className="py-16 text-center text-sm text-slate-500">Loading…</div>
+            <div className="py-16 text-center text-sm text-slate-500 flex items-center justify-center gap-2">
+              <Loader2 className="h-4 w-4 animate-spin" /> Loading expenses...
+            </div>
           ) : filtered.length === 0 ? (
-            <div className="py-16 text-center">
-              <Receipt className="h-10 w-10 mx-auto text-slate-300 mb-2" />
-              <p className="text-slate-500 text-sm">No expenses found. Add your first one to get started.</p>
+            <div className="p-6">
+              <EmptyState
+                icon={<Receipt className="h-7 w-7" strokeWidth={1.8} />}
+                title={
+                  expenses && expenses.length === 0
+                    ? "No expenses yet"
+                    : search.trim() || categoryFilter !== "ALL"
+                      ? "No matching expenses"
+                      : "No expenses yet"
+                }
+                description={
+                  expenses && expenses.length === 0
+                    ? "Log business costs like software, travel, and materials to see your true profit."
+                    : search.trim()
+                      ? `No expenses match "${search}". Try different keywords or clear filters.`
+                      : "No expenses in this category."
+                }
+                action={
+                  expenses && expenses.length === 0 ? (
+                    <Button onClick={openNew} className="bg-gradient-to-r from-rose-500 to-orange-600 hover:from-rose-600 hover:to-orange-700 shadow-lg shadow-rose-500/25">
+                      <Plus className="h-4 w-4 mr-2" />
+                      Add first expense
+                    </Button>
+                  ) : (
+                    <Button variant="outline" onClick={() => { setSearch(""); setCategoryFilter("ALL"); }}>
+                      <X className="h-4 w-4 mr-2" />
+                      Clear filters
+                    </Button>
+                  )
+                }
+              />
             </div>
           ) : (
             <div className="divide-y divide-slate-100 dark:divide-slate-800">
-              {filtered.map((ex) => (
-                <div key={ex.id} className="px-5 py-3 flex items-center gap-4 hover:bg-slate-50 dark:hover:bg-slate-900/40">
-                  <div className="w-24 text-xs text-slate-500 font-mono">{formatDate(ex.date)}</div>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm font-medium text-slate-900 dark:text-white truncate">{ex.description}</p>
-                    {ex.notes && <p className="text-xs text-slate-500 truncate">{ex.notes}</p>}
+              {filtered.map((ex) => {
+                const c = catStyle(ex.category);
+                return (
+                  <div key={ex.id} className="px-5 py-3.5 flex items-center gap-4 hover:bg-slate-50/70 dark:hover:bg-slate-800/40 group transition-colors">
+                    <div className="w-24 shrink-0 text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums">
+                      {formatDate(ex.date)}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-medium text-slate-900 dark:text-white truncate">{ex.description}</p>
+                      {ex.notes ? (
+                        <p className="text-xs text-slate-500 dark:text-slate-400 truncate mt-0.5">{ex.notes}</p>
+                      ) : (
+                        <p className="text-xs text-slate-400 dark:text-slate-500 mt-0.5">No notes</p>
+                      )}
+                    </div>
+                    <Badge className={`${c.pill} hidden sm:inline-flex`}>
+                      <span className="h-1.5 w-1.5 rounded-full mr-1.5" style={{ background: c.dot }} />
+                      {ex.category}
+                    </Badge>
+                    <p className="text-sm font-semibold text-rose-600 dark:text-rose-400 tabular-nums w-24 text-right shrink-0">
+                      −{formatMoney(Number(ex.amount), currency)}
+                    </p>
+                    <div className="flex items-center gap-1 w-[72px] justify-end opacity-0 group-hover:opacity-100 transition-opacity no-print">
+                      <button
+                        type="button"
+                        onClick={() => openEdit(ex)}
+                        className="h-8 w-8 rounded-md text-slate-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-950/40 flex items-center justify-center"
+                        aria-label="Edit expense"
+                      >
+                        <Pencil className="h-3.5 w-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleDelete(ex.id)}
+                        className="h-8 w-8 rounded-md text-slate-400 hover:text-red-600 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/30 flex items-center justify-center"
+                        aria-label="Delete expense"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
                   </div>
-                  <Badge className={CATEGORY_COLORS[ex.category] || CATEGORY_COLORS.General}>{ex.category}</Badge>
-                  <p className="text-sm font-semibold text-rose-600 dark:text-rose-400 tabular-nums w-24 text-right">
-                    −{formatMoney(Number(ex.amount), currency)}
-                  </p>
-                  <div className="flex items-center gap-1">
-                    <button
-                      type="button"
-                      onClick={() => openEdit(ex)}
-                      className="h-8 w-8 rounded-md text-slate-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-slate-100 dark:hover:bg-slate-800 flex items-center justify-center"
-                    >
-                      <Pencil className="h-3.5 w-3.5" />
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleDelete(ex.id)}
-                      className="h-8 w-8 rounded-md text-slate-400 hover:text-red-600 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/30 flex items-center justify-center"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </CardContent>
       </Card>
 
-      {showForm && (
-        <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4" onClick={() => setShowForm(false)}>
-          <Card className="w-full max-w-md" onClick={(e) => e.stopPropagation()}>
-            <CardHeader>
-              <CardTitle>{editingId ? "Edit Expense" : "Add Expense"}</CardTitle>
-            </CardHeader>
-            <form onSubmit={handleSubmit}>
-              <CardContent className="space-y-4">
-                {formError && (
-                  <div className="rounded-lg bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 p-3 text-sm text-red-700 dark:text-red-300 flex items-start gap-2">
-                    <X className="h-4 w-4 mt-0.5 shrink-0" /> {formError}
+      {/* Category breakdown (when data exists) */}
+      {!loading && totals.byCategory.length > 0 && (
+        <Card className="surface overflow-hidden">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-base flex items-center gap-2">
+              <PieIcon className="h-4 w-4 text-violet-500" />
+              Category Breakdown
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="pt-0 space-y-2.5">
+            {totals.byCategory.slice(0, 6).map((c) => {
+              const pct = totals.maxCat > 0 ? (c.amount / totals.maxCat) * 100 : 0;
+              return (
+                <div key={c.name} className="space-y-1">
+                  <div className="flex items-center justify-between text-xs">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="h-2 w-2 rounded-full shrink-0" style={{ background: c.dot }} />
+                      <span className="font-medium text-slate-700 dark:text-slate-300 truncate">{c.name}</span>
+                    </div>
+                    <span className="font-semibold tabular-nums text-slate-900 dark:text-white">
+                      {formatMoney(c.amount, currency)}
+                    </span>
                   </div>
-                )}
-                <div className="grid grid-cols-2 gap-3">
-                  <div className="space-y-1.5">
-                    <Label htmlFor="x-date">Date</Label>
-                    <Input id="x-date" type="date" value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} className="h-10" required />
-                  </div>
-                  <div className="space-y-1.5">
-                    <Label htmlFor="x-amount">Amount ({currency})</Label>
-                    <Input id="x-amount" type="number" min={0.01} step={0.01} value={form.amount} onChange={(e) => setForm({ ...form, amount: Number(e.target.value) })} className="h-10" required />
+                  <div className="h-1.5 w-full rounded-full bg-slate-100 dark:bg-slate-800 overflow-hidden">
+                    <div
+                      className="h-full rounded-full transition-all duration-500"
+                      style={{ width: `${pct}%`, background: c.dot }}
+                    />
                   </div>
                 </div>
-                <div className="space-y-1.5">
-                  <Label htmlFor="x-cat">Category</Label>
-                  <Select id="x-cat" value={form.category} onChange={(e) => setForm({ ...form, category: e.target.value })} className="h-10 bg-white dark:bg-slate-950">
-                    {DEFAULT_EXPENSE_CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
-                  </Select>
-                </div>
-                <div className="space-y-1.5">
-                  <Label htmlFor="x-desc">Description</Label>
-                  <Input id="x-desc" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} className="h-10" maxLength={200} required />
-                </div>
-                <div className="space-y-1.5">
-                  <Label htmlFor="x-notes">Notes (optional)</Label>
-                  <Textarea id="x-notes" value={form.notes ?? ""} onChange={(e) => setForm({ ...form, notes: e.target.value })} rows={2} maxLength={1000} />
-                </div>
-              </CardContent>
-              <div className="flex justify-end gap-2 px-6 pb-6">
-                <Button type="button" variant="ghost" onClick={() => setShowForm(false)}>Cancel</Button>
-                <Button type="submit" disabled={submitting}>
-                  {submitting ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Save className="h-4 w-4 mr-2" />}
-                  {editingId ? "Save" : "Add"}
-                </Button>
-              </div>
-            </form>
-          </Card>
-        </div>
+              );
+            })}
+          </CardContent>
+        </Card>
       )}
-    </div>
+
+      <Dialog open={showForm} onOpenChange={setShowForm}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>{editingId ? "Edit Expense" : "Add Expense"}</DialogTitle>
+            <DialogDescription>
+              {editingId ? "Update the expense entry." : "Log a new business expense."}
+            </DialogDescription>
+          </DialogHeader>
+          <form onSubmit={handleSubmit}>
+            <div className="space-y-4 py-2">
+              {formError && (
+                <div className="rounded-lg bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 p-3 text-sm text-red-700 dark:text-red-300 flex items-start gap-2">
+                  <X className="h-4 w-4 mt-0.5 shrink-0" /> {formError}
+                </div>
+              )}
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-1.5">
+                  <Label htmlFor="x-date">Date</Label>
+                  <Input id="x-date" type="date" value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} className="h-10" required />
+                </div>
+                <div className="space-y-1.5">
+                  <Label htmlFor="x-amount">Amount ({currency})</Label>
+                  <Input id="x-amount" type="number" min={0.01} step={0.01} value={form.amount} onChange={(e) => setForm({ ...form, amount: Number(e.target.value) })} className="h-10" required />
+                </div>
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="x-cat">Category</Label>
+                <Select id="x-cat" value={form.category} onChange={(e) => setForm({ ...form, category: e.target.value })} className="h-10 bg-white dark:bg-slate-950">
+                  {DEFAULT_EXPENSE_CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
+                </Select>
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="x-desc">Description</Label>
+                <Input id="x-desc" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} className="h-10" maxLength={200} required />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="x-notes">Notes (optional)</Label>
+                <Textarea id="x-notes" value={form.notes ?? ""} onChange={(e) => setForm({ ...form, notes: e.target.value })} rows={2} maxLength={1000} />
+              </div>
+            </div>
+            <DialogFooter className="pt-2">
+              <Button type="button" variant="ghost" onClick={() => setShowForm(false)}>Cancel</Button>
+              <Button type="submit" disabled={submitting}>
+                {submitting ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Save className="h-4 w-4 mr-2" />}
+                {editingId ? "Save changes" : "Add expense"}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+    </PageTransition>
   );
 }

@@ -73,6 +73,11 @@ export async function POST(request: Request) {
       return jsonError("A client with this email already exists", 409);
     }
 
+    // FK violation — session references a deleted/reset user.
+    if (getPrismaErrorCode(error) === "P2003") {
+      return unauthorized();
+    }
+
     console.error("[POST /api/clients] Failed to create client:", error);
     return jsonError("Failed to create client", 500);
   }

@@ -32,6 +32,10 @@ import {
   Receipt,
   Pencil,
   Ban,
+  ExternalLink,
+  Send,
+  Copy,
+  Sparkles,
 } from "lucide-react";
 import { formatDate } from "@/lib/utils";
 import { formatMoney } from "@/lib/format-money";
@@ -40,11 +44,13 @@ import { SendInvoiceButton } from "@/components/invoices/send-invoice-button";
 import { DownloadPdfButton } from "@/components/invoices/download-pdf-button";
 import { RemindInvoiceButton } from "@/components/invoices/remind-invoice-button";
 import { PayInvoiceButton } from "@/components/invoices/pay-invoice-button";
-import { PayMethods } from "@/components/invoices/pay-methods";
 import { ActivityTimeline } from "@/components/invoices/activity-timeline";
 import { DuplicateInvoiceButton } from "@/components/invoices/duplicate-invoice-button";
 import { CopyLinkButton } from "@/components/invoices/copy-link-button";
 import { VoidInvoiceButton } from "@/components/invoices/void-invoice-button";
+import { PageHeader } from "@/components/ui/page-header";
+import { EmptyState } from "@/components/ui/empty-state";
+import { PageTransition } from "@/components/page-transition";
 
 interface PaymentGatewayConfig {
   stripe: boolean;
@@ -165,7 +171,10 @@ export default function InvoiceDetailPage() {
     return (
       <div className="flex items-center justify-center py-24">
         <div className="text-center">
-          <Loader2 className="h-8 w-8 animate-spin text-blue-600 mx-auto" />
+          <div className="h-12 w-12 rounded-2xl bg-blue-100 dark:bg-blue-950/50 flex items-center justify-center mx-auto animate-pulse">
+            <FileText className="h-6 w-6 text-blue-600" />
+          </div>
+          <Loader2 className="h-5 w-5 animate-spin text-blue-600 mx-auto mt-4" />
           <p className="text-sm text-slate-500 mt-3">Loading invoice...</p>
         </div>
       </div>
@@ -174,12 +183,20 @@ export default function InvoiceDetailPage() {
 
   if (error || !invoice) {
     return (
-      <div className="text-center py-24">
-        <FileText className="h-12 w-12 mx-auto text-slate-300 dark:text-slate-600 mb-3" />
-        <p className="font-medium text-slate-700 dark:text-slate-200">{error ?? "Invoice not found"}</p>
-        <Link href="/invoices" className="inline-block mt-4">
-          <Button variant="outline">Back to Invoices</Button>
-        </Link>
+      <div className="max-w-md mx-auto py-12">
+        <EmptyState
+          icon={<FileText className="h-7 w-7" strokeWidth={1.8} />}
+          title="Invoice not found"
+          description={error ?? "We couldn't locate this invoice — it may have been deleted, or you might not have access to it."}
+          action={
+            <Link href="/invoices">
+              <Button>
+                <ArrowLeft className="h-4 w-4 mr-2" />
+                Back to Invoices
+              </Button>
+            </Link>
+          }
+        />
       </div>
     );
   }
@@ -211,106 +228,126 @@ export default function InvoiceDetailPage() {
   const daysOverdue = isPending ? Math.floor((today.getTime() - dueDate.getTime()) / (1000 * 60 * 60 * 24)) : 0;
   const isOverdue = daysOverdue > 0;
 
+  const overdueBadge = isOverdue ? (
+    <Badge variant="danger" className="gap-1">
+      <Clock className="h-3 w-3" />
+      {daysOverdue}d overdue
+    </Badge>
+  ) : null;
+
+  const primaryPayButton = isPending ? (
+    payments && payments.razorpay && !payments.stripe ? (
+      <PayInvoiceButton
+        invoiceId={invoice.id}
+        alreadyPaid={isPaid}
+        size="sm"
+        provider="razorpay"
+        razorpayKeyId={payments.razorpayKeyId}
+        className="bg-emerald-600 hover:bg-emerald-700 text-white shadow-md shadow-emerald-500/25"
+        label="Record Payment"
+      />
+    ) : (
+      <PayInvoiceButton
+        invoiceId={invoice.id}
+        alreadyPaid={isPaid}
+        size="sm"
+        className="bg-emerald-600 hover:bg-emerald-700 text-white shadow-md shadow-emerald-500/25"
+        label="Record Payment"
+      />
+    )
+  ) : null;
+
   return (
-    <div className="space-y-6 max-w-5xl mx-auto">
-      {/* Actions */}
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between no-print">
-        <div className="flex items-center gap-3">
-          <Link href="/invoices">
-            <Button variant="ghost" size="icon" className="rounded-full">
-              <ArrowLeft className="h-5 w-5" />
+    <PageTransition className="space-y-6 max-w-5xl mx-auto">
+      <PageHeader
+        title={invoice.invoiceNumber}
+        description={
+          <>
+            <span className="font-medium text-slate-700 dark:text-slate-300">{invoice.client.name}</span>
+            <span className="mx-1.5 text-slate-300 dark:text-slate-700">·</span>
+            Issued {formatDate(issueDate)}
+            {invoice.paidAt && <>
+              <span className="mx-1.5 text-slate-300 dark:text-slate-700">·</span>
+              Paid {formatDate(invoice.paidAt)}
+            </>}
+          </>
+        }
+        icon={<FileText className="h-5 w-5" strokeWidth={2.2} />}
+        iconGradient={
+          isPaid ? "from-emerald-500 to-green-600"
+          : isVoid ? "from-slate-500 to-slate-700"
+          : isOverdue ? "from-red-500 to-rose-600"
+          : isDraft ? "from-slate-400 to-slate-600"
+          : "from-blue-600 to-indigo-600"
+        }
+        badge={
+          <span className="inline-flex items-center gap-1.5">
+            <StatusBadge status={invoice.status} />
+            {overdueBadge}
+          </span>
+        }
+      >
+        <Link href="/invoices">
+          <Button variant="outline" size="sm" className="bg-white/70 dark:bg-slate-900/60">
+            <ArrowLeft className="h-4 w-4 mr-2" />
+            All invoices
+          </Button>
+        </Link>
+        <Link href={`/clients/${invoice.clientId}`}>
+          <Button variant="outline" size="sm" className="bg-white/70 dark:bg-slate-900/60">
+            <ExternalLink className="h-4 w-4 mr-2" />
+            Client
+          </Button>
+        </Link>
+        {(isPending || isDraft) && (
+          <SendInvoiceButton invoiceId={invoice.id} clientEmail={invoice.client.email} />
+        )}
+        {isPending && primaryPayButton}
+      </PageHeader>
+
+      {/* Quick action toolbar */}
+      <div className="flex flex-wrap gap-2 no-print">
+        {!isVoid && (
+          <Link href={`/invoices/${invoice.id}/edit`}>
+            <Button variant="outline" size="sm" className="bg-white/70 dark:bg-slate-900/60">
+              <Pencil className="h-4 w-4 mr-2" /> Edit
             </Button>
           </Link>
-          <div>
-            <div className="flex items-center gap-3">
-              <h1 className="text-2xl sm:text-3xl font-bold tracking-tight font-mono">{invoice.invoiceNumber}</h1>
-              <StatusBadge status={invoice.status} />
-              {isOverdue && (
-                <Badge variant="destructive" className="gap-1">
-                  <Clock className="h-3 w-3" />
-                  {daysOverdue}d overdue
-                </Badge>
-              )}
-            </div>
-            <p className="text-slate-500 dark:text-slate-400 mt-1 text-sm">
-              Created {formatDate(invoice.createdAt)} · {invoice.client.name}
-            </p>
-          </div>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          {!isVoid && (
-            <Link href={`/invoices/${invoice.id}/edit`}>
-              <Button variant="outline">
-                <Pencil className="h-4 w-4 mr-2" /> Edit
-              </Button>
-            </Link>
-          )}
-          {(isPending || isDraft) && (
-            <SendInvoiceButton invoiceId={invoice.id} clientEmail={invoice.client.email} />
-          )}
-          {isPending && (
-            <>
-              {payments && (payments.stripe || payments.razorpay) ? (
-                payments.razorpay && !payments.stripe ? (
-                  <PayInvoiceButton
-                    invoiceId={invoice.id}
-                    alreadyPaid={isPaid}
-                    size="default"
-                    provider="razorpay"
-                    razorpayKeyId={payments.razorpayKeyId}
-                    className="bg-emerald-600 hover:bg-emerald-700 text-white shadow-lg shadow-emerald-500/25"
-                  />
-                ) : (
-                  <PayInvoiceButton
-                    invoiceId={invoice.id}
-                    alreadyPaid={isPaid}
-                    size="default"
-                    className="bg-emerald-600 hover:bg-emerald-700 text-white shadow-lg shadow-emerald-500/25"
-                  />
-                )
-              ) : (
-                <PayInvoiceButton
-                  invoiceId={invoice.id}
-                  alreadyPaid={isPaid}
-                  size="default"
-                  className="bg-emerald-600 hover:bg-emerald-700 text-white shadow-lg shadow-emerald-500/25"
-                />
-              )}
-              <RemindInvoiceButton
-                invoiceId={invoice.id}
-                clientEmail={invoice.client.email}
-                disabled={actionLoading !== null}
-                onSent={fetchAll}
-                variant={isOverdue ? "default" : "outline"}
-                className={isOverdue ? "bg-amber-600 hover:bg-amber-700 text-white" : ""}
-              />
-            </>
-          )}
-          {!isPaid && !isVoid && (
-            <Button onClick={handleMarkPaid} disabled={actionLoading !== null} variant="secondary">
-              {actionLoading === "markPaid" ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <CheckCircle2 className="h-4 w-4 mr-2" />}
-              Mark as Paid
-            </Button>
-          )}
-          <DownloadPdfButton invoiceId={invoice.id} />
-          <CopyLinkButton invoiceId={invoice.id} />
-          <DuplicateInvoiceButton invoiceId={invoice.id} />
-          <Button variant="outline" onClick={handlePrint}>
-            <Printer className="h-4 w-4 mr-2" /> Print
+        )}
+        {isPending && (
+          <RemindInvoiceButton
+            invoiceId={invoice.id}
+            clientEmail={invoice.client.email}
+            disabled={actionLoading !== null}
+            onSent={fetchAll}
+            variant="outline"
+            size="sm"
+          />
+        )}
+        {!isPaid && !isVoid && (
+          <Button onClick={handleMarkPaid} disabled={actionLoading !== null} variant="outline" size="sm" className="bg-white/70 dark:bg-slate-900/60">
+            {actionLoading === "markPaid" ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <CheckCircle2 className="h-4 w-4 mr-2 text-emerald-600" />}
+            Mark as Paid
           </Button>
-          {!isVoid && (
-            <VoidInvoiceButton
-              invoiceId={invoice.id}
-              invoiceNumber={invoice.invoiceNumber}
-              variant="outline"
-              disabled={actionLoading !== null}
-            />
-          )}
-          <Button variant="destructive" onClick={handleDelete} disabled={actionLoading !== null}>
-            {actionLoading === "delete" ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Trash2 className="h-4 w-4 mr-2" />}
-            Delete
-          </Button>
-        </div>
+        )}
+        <DownloadPdfButton invoiceId={invoice.id} />
+        <CopyLinkButton invoiceId={invoice.id} />
+        <DuplicateInvoiceButton invoiceId={invoice.id} />
+        <Button variant="outline" size="sm" onClick={handlePrint} className="bg-white/70 dark:bg-slate-900/60">
+          <Printer className="h-4 w-4 mr-2" /> Print
+        </Button>
+        {!isVoid && (
+          <VoidInvoiceButton
+            invoiceId={invoice.id}
+            invoiceNumber={invoice.invoiceNumber}
+            variant="outline"
+            disabled={actionLoading !== null}
+          />
+        )}
+        <Button variant="outline" size="sm" onClick={handleDelete} disabled={actionLoading !== null} className="text-red-600 hover:text-red-700 hover:bg-red-50 dark:hover:bg-red-950/30 bg-white/70 dark:bg-slate-900/60">
+          {actionLoading === "delete" ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Trash2 className="h-4 w-4 mr-2" />}
+          Delete
+        </Button>
       </div>
 
       {/* Status Banner */}
@@ -574,6 +611,6 @@ export default function InvoiceDetailPage() {
           </div>
         </aside>
       </div>{/* /grid */}
-    </div>
+    </PageTransition>
   );
 }

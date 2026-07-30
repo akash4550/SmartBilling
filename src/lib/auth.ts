@@ -5,20 +5,26 @@ import { prisma } from "@/lib/prisma";
 
 export { type DefaultSession } from "next-auth";
 
-// ---------------------------------------------------------------------------
-// Extend the NextAuth type to include `id` on the session user
-// ---------------------------------------------------------------------------
+// Extend the NextAuth types to include `id` and `sessionVersion`.
 declare module "next-auth" {
   interface Session {
     user: {
       id: string;
+      sessionVersion: number;
     } & DefaultSession["user"];
   }
 }
 
-// ---------------------------------------------------------------------------
-// NextAuth v5 configuration
-// ---------------------------------------------------------------------------
+// Extend the JWT shape with sessionVersion so we can revoke tokens later.
+declare module "@auth/core/jwt" {
+  interface JWT {
+    id?: string;
+    sessionVersion?: number;
+    name?: string | null;
+    email?: string | null;
+  }
+}
+
 const providers: Provider[] = [
   Credentials({
     name: "credentials",
@@ -40,13 +46,9 @@ const providers: Provider[] = [
 
       const user = await prisma.user.findUnique({ where: { email } });
       if (!user) {
-        // Use a generic error to avoid user-enumeration.
         throw new CredentialsSignin("Invalid email or password");
       }
 
-      // Lazy-load argon2 so that native module resolution only happens at
-      // request time (avoids Next 16 Turbopack dev-server bundling issues
-      // with native addons during SSR of unrelated pages).
       let valid = false;
       try {
         const argon2 = (await import("argon2")).default;
@@ -62,6 +64,8 @@ const providers: Provider[] = [
         id: user.id,
         name: user.name,
         email: user.email,
+        // Embed sessionVersion so downstream checks can revoke stale JWTs.
+        sessionVersion: user.sessionVersion,
       };
     },
   }),
@@ -76,20 +80,21 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
   },
   callbacks: {
     async jwt({ token, user }) {
-      // On first sign-in, embed the user's id into the JWT.
+      // On first sign-in, embed user id + sessionVersion into the JWT.
       if (user) {
         token.id = (user as { id: string }).id;
         token.name = user.name;
         token.email = user.email;
+        token.sessionVersion = (user as { sessionVersion?: number }).sessionVersion ?? 0;
       }
       return token;
     },
     async session({ session, token }) {
-      // Expose id + name/email in the client-accessible session.
       if (token && session.user) {
         session.user.id = token.id as string;
         session.user.name = token.name as string;
         session.user.email = token.email as string;
+        session.user.sessionVersion = (token.sessionVersion as number) ?? 0;
       }
       return session;
     },

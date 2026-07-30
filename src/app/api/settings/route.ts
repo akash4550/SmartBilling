@@ -9,17 +9,29 @@ import {
   unauthorized,
 } from "@/lib/api-helpers";
 import { getBrandingForUser } from "@/lib/branding";
+import { getPrismaErrorCode } from "@/lib/api-helpers";
 
 /**
  * Helper that returns the current user's settings row, creating it with
  * defaults if it doesn't yet exist.
+ *
+ * Any FK violation (P2003) is treated as "user no longer exists" and returns
+ * null so callers can bail out with a 401 instead of throwing.
  */
 export async function getSettingsForUser(userId: string) {
-  return prisma.settings.upsert({
-    where: { userId },
-    update: {},
-    create: { userId },
-  });
+  try {
+    return await prisma.settings.upsert({
+      where: { userId },
+      update: {},
+      create: { userId },
+    });
+  } catch (err) {
+    if (getPrismaErrorCode(err) === "P2003") {
+      console.error("[getSettingsForUser] FK violation — user does not exist:", userId);
+      return null;
+    }
+    throw err;
+  }
 }
 
 /** GET /api/settings — fetch current user's settings (creating defaults if needed). */
@@ -28,6 +40,7 @@ export async function GET() {
     const user = await requireUser();
     if (!user) return unauthorized();
     const settings = await getSettingsForUser(user.id);
+    if (!settings) return unauthorized();
     const { logoUrl, brandColor } = await getBrandingForUser(user.id);
     // Don't leak raw base64 to the list view — the logo URL is enough for
     // rendering previews; uploads go through the dedicated /logo endpoint.
@@ -61,11 +74,17 @@ export async function PATCH(request: Request) {
       return jsonError("No fields to update", 400);
     }
 
-    const updated = await prisma.settings.upsert({
-      where: { userId: user.id },
-      update: validated,
-      create: { userId: user.id, ...validated },
-    });
+    let updated;
+    try {
+      updated = await prisma.settings.upsert({
+        where: { userId: user.id },
+        update: validated,
+        create: { userId: user.id, ...validated },
+      });
+    } catch (err) {
+      if (getPrismaErrorCode(err) === "P2003") return unauthorized();
+      throw err;
+    }
 
     const { logoUrl, brandColor } = await getBrandingForUser(user.id);
     const { logoData: _o, logoContentType: _o2, ...rest } = updated;

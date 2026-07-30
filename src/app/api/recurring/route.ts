@@ -74,6 +74,7 @@ export async function POST(request: Request) {
         endDate: validated.endDate ? new Date(validated.endDate) : null,
         items: {
           create: validated.items.map((item) => ({
+            userId: user.id,
             description: item.description,
             quantity: item.quantity,
             price: item.price,

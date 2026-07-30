@@ -18,6 +18,7 @@ import { getSiteUrl } from "@/lib/stripe";
 import { getBrandingForUser } from "@/lib/branding";
 import { sendInvoiceEmail } from "@/lib/send-invoice-email";
 import { logActivity } from "@/lib/activity";
+import { timingSafeEqual } from "@/lib/api-helpers";
 
 export const dynamic = "force-dynamic";
 
@@ -52,7 +53,7 @@ export async function GET(request: Request) {
     if (secret) {
       const auth = request.headers.get("authorization") ?? "";
       const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-      if (token !== secret) {
+      if (!token || !timingSafeEqual(token, secret)) {
         return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
       }
     }

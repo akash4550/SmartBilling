@@ -3,6 +3,8 @@
 import {
   BarChart,
   Bar,
+  Line,
+  ComposedChart,
   XAxis,
   YAxis,
   CartesianGrid,
@@ -12,7 +14,7 @@ import {
 } from "recharts";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { formatCurrency } from "@/lib/utils";
-import { TrendingUp, TrendingDown } from "lucide-react";
+import { TrendingUp, TrendingDown, LineChart as LineIcon } from "lucide-react";
 
 export interface PnlDatum {
   key: string;
@@ -39,7 +41,7 @@ function CustomTooltip({
 }) {
   if (!active || !payload || payload.length === 0) return null;
   return (
-    <div className="rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-4 py-3 shadow-xl text-sm space-y-1">
+    <div className="rounded-xl border border-slate-200/80 dark:border-slate-700/80 bg-white/95 dark:bg-slate-900/95 backdrop-blur px-4 py-3 shadow-xl text-sm space-y-1">
       <p className="font-semibold text-slate-900 dark:text-slate-100 mb-1">{label}</p>
       {payload.map((p) => (
         <p key={p.name} className="flex items-center gap-2">
@@ -73,24 +75,38 @@ export function PnlChart({ data, title = "Profit & Loss (Last 6 Months)" }: PnlC
   const positive = (pctChange ?? 0) >= 0;
 
   return (
-    <Card className="border-slate-200/60 dark:border-slate-800/60 overflow-hidden">
-      <CardHeader className="flex flex-row items-center justify-between pb-2">
+    <Card className="border-slate-200/70 dark:border-slate-800/70 bg-white/80 dark:bg-slate-900/60 backdrop-blur-sm overflow-hidden">
+      <CardHeader className="flex flex-row items-start justify-between pb-2 gap-4">
         <div>
-          <CardTitle className="text-base">{title}</CardTitle>
-          <div className="flex items-baseline gap-2 mt-1 flex-wrap">
+          <CardTitle className="text-base flex items-center gap-2 text-slate-900 dark:text-white">
+            <span className="inline-flex h-7 w-7 items-center justify-center rounded-lg bg-emerald-100 dark:bg-emerald-950/50">
+              <LineIcon className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+            </span>
+            {title}
+          </CardTitle>
+          <div className="flex items-baseline gap-2 mt-2 flex-wrap">
             <span className="text-2xl font-bold tabular-nums text-emerald-600 dark:text-emerald-400">
               {formatCurrency(totals.profit)}
             </span>
-            <span className="text-sm text-slate-500">net profit</span>
+            <span className="text-sm text-slate-500 dark:text-slate-400">net profit</span>
             {pctChange !== null && pctChange !== 0 && (
-              <span className={`inline-flex items-center text-xs font-medium ${positive ? "text-emerald-600 dark:text-emerald-400" : "text-red-600 dark:text-red-400"}`}>
+              <span
+                className={`inline-flex items-center text-xs font-semibold px-2 py-0.5 rounded-full ${
+                  positive
+                    ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-400"
+                    : "bg-red-50 text-red-700 dark:bg-red-950/50 dark:text-red-400"
+                }`}
+              >
                 {positive ? <TrendingUp className="h-3 w-3 mr-0.5" /> : <TrendingDown className="h-3 w-3 mr-0.5" />}
-                {positive ? "+" : ""}{pctChange}%
+                {positive ? "+" : ""}
+                {pctChange}%
               </span>
             )}
           </div>
-          <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-            Revenue {formatCurrency(totals.revenue)} · Expenses {formatCurrency(totals.expenses)}
+          <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+            Revenue <span className="text-slate-700 dark:text-slate-300 font-medium tabular-nums">{formatCurrency(totals.revenue)}</span>
+            <span className="mx-1.5">·</span>
+            Expenses <span className="text-slate-700 dark:text-slate-300 font-medium tabular-nums">{formatCurrency(totals.expenses)}</span>
           </p>
         </div>
       </CardHeader>
@@ -103,7 +119,13 @@ export function PnlChart({ data, title = "Profit & Loss (Last 6 Months)" }: PnlC
         ) : (
           <div className="h-64 w-full">
             <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={data} margin={{ top: 8, right: 12, left: 0, bottom: 8 }}>
+              <ComposedChart data={data} margin={{ top: 8, right: 12, left: 0, bottom: 8 }}>
+                <defs>
+                  <linearGradient id="profitLine" x1="0" y1="0" x2="1" y2="0">
+                    <stop offset="0%" stopColor="#10b981" />
+                    <stop offset="100%" stopColor="#059669" />
+                  </linearGradient>
+                </defs>
                 <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" vertical={false} strokeOpacity={0.5} />
                 <XAxis
                   dataKey="label"
@@ -124,9 +146,18 @@ export function PnlChart({ data, title = "Profit & Loss (Last 6 Months)" }: PnlC
                   iconType="circle"
                   iconSize={8}
                 />
-                <Bar dataKey="revenue" name="Revenue" fill="#10b981" radius={[4, 4, 0, 0]} maxBarSize={28} />
-                <Bar dataKey="expenses" name="Expenses" fill="#f43f5e" radius={[4, 4, 0, 0]} maxBarSize={28} />
-              </BarChart>
+                <Bar dataKey="revenue" name="Revenue" fill="#10b981" radius={[4, 4, 0, 0]} maxBarSize={22} stackId="a" fillOpacity={0.85} />
+                <Bar dataKey="expenses" name="Expenses" fill="#f43f5e" radius={[4, 4, 0, 0]} maxBarSize={22} fillOpacity={0.85} />
+                <Line
+                  type="monotone"
+                  dataKey="profit"
+                  name="Profit"
+                  stroke="url(#profitLine)"
+                  strokeWidth={2.5}
+                  dot={{ r: 3, fill: "#10b981", strokeWidth: 0 }}
+                  activeDot={{ r: 5, fill: "#059669", stroke: "#fff", strokeWidth: 2 }}
+                />
+              </ComposedChart>
             </ResponsiveContainer>
           </div>
         )}

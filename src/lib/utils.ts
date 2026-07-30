@@ -1,5 +1,6 @@
 import { type ClassValue, clsx } from "clsx";
 import { twMerge } from "tailwind-merge";
+import { calcInvoiceTotals as _calcInvoiceTotals } from "@/lib/money";
 
 // ============================================================
 // TAILWIND CLASS MERGER
@@ -121,25 +122,19 @@ export function generateInvoiceNumber(
 // ============================================================
 // INVOICE TOTAL CALCULATION
 // ============================================================
+// Backwards-compatible types for the old float-based API.
 export type DiscountType = "PERCENT" | "FIXED";
 
 export interface DiscountInput {
-  /** Discount value interpretation. null/undefined = no discount. */
   type?: DiscountType | null;
-  /** Discount value — percent (0..100) when PERCENT, flat amount when FIXED. */
   value?: number | null;
 }
 
 export interface InvoiceTotals {
-  /** Sum of (quantity * price) across all items, before discount/tax. */
   subtotal: number;
-  /** Absolute discount amount applied (0 if no discount). */
   discountAmount: number;
-  /** Net amount after discount but before tax. */
   netAmount: number;
-  /** Computed tax amount: netAmount * (taxRate / 100). */
   taxAmount: number;
-  /** Grand total: netAmount + taxAmount. */
   total: number;
 }
 
@@ -149,58 +144,30 @@ export interface InvoiceLineItemInput {
 }
 
 /**
- * Round a number to 2 decimal places using banker-safe rounding
- * (scaled integer rounding to avoid IEEE-754 floating-point drift).
- */
-function round2(value: number): number {
-  return Math.round((value + Number.EPSILON) * 100) / 100;
-}
-
-/**
  * Given line items, a tax rate, and an optional discount, compute
  * subtotal, discount, net (post-discount, pre-tax), tax, and grand total.
- * Discount is applied pre-tax (the standard for most jurisdictions).
  *
- * @example
- * calculateInvoiceTotals(
- *   [{ quantity: 2, price: 100 }, { quantity: 1, price: 50 }],
- *   18,
- *   { type: "PERCENT", value: 10 }
- * )
- * // → { subtotal: 250, discountAmount: 25, netAmount: 225, taxAmount: 40.50, total: 265.50 }
+ * Implementation now delegates to the integer-paise BigInt calculator in
+ * `src/lib/money.ts` to avoid IEEE-754 float drift. Discount is applied
+ * pre-tax (standard for GST/VAT regimes).
  */
 export function calculateInvoiceTotals(
   items: readonly InvoiceLineItemInput[],
   taxRate: number = 0,
   discount: DiscountInput = {}
 ): InvoiceTotals {
-  const safeTaxRate = Math.max(0, Math.min(100, Number(taxRate) || 0));
-
-  const subtotal = round2(
-    items.reduce((sum, item) => {
-      const qty = Number(item.quantity) || 0;
-      const price = Number(item.price) || 0;
-      return sum + round2(qty * price);
-    }, 0)
+  const out = _calcInvoiceTotals(
+    items.map((it) => ({ quantity: it.quantity, price: it.price })),
+    taxRate,
+    discount
   );
-
-  // Compute discount (capped so it can't exceed subtotal).
-  let discountAmount = 0;
-  if (discount.type && discount.value != null && Number(discount.value) > 0) {
-    const raw = Number(discount.value);
-    if (discount.type === "PERCENT") {
-      const pct = Math.max(0, Math.min(100, raw));
-      discountAmount = round2((subtotal * pct) / 100);
-    } else {
-      discountAmount = Math.max(0, round2(Math.min(raw, subtotal)));
-    }
-  }
-
-  const netAmount = round2(subtotal - discountAmount);
-  const taxAmount = round2((netAmount * safeTaxRate) / 100);
-  const total = round2(netAmount + taxAmount);
-
-  return { subtotal, discountAmount, netAmount, taxAmount, total };
+  return {
+    subtotal: out.subtotal,
+    discountAmount: out.discountAmount,
+    netAmount: out.netAmount,
+    taxAmount: out.taxAmount,
+    total: out.total,
+  };
 }
 
 // ============================================================

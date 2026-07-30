@@ -5,6 +5,13 @@ const nextConfig: NextConfig = {
   reactStrictMode: true,
   poweredByHeader: false,
 
+  // Pin Turbopack's workspace root to this project directory so dev mode
+  // doesn't warn about "multiple lockfiles" when there happens to be a
+  // package-lock.json in a parent folder (common on Windows with OneDrive).
+  turbopack: {
+    root: import.meta.dirname,
+  },
+
   // Only allow images from same-origin (public folder) by default.
   // Add external hostnames here (e.g. avatars, logos) as they are introduced.
   images: {

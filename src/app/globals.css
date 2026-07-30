@@ -38,7 +38,7 @@
     --secondary: 217.2 32.6% 17.5%;
     --secondary-foreground: 210 40% 98%;
     --muted: 217.2 32.6% 17.5%;
-    --muted-foreground: 215 20.2% 65.1%;
+    --muted-foreground: 215.2 20.2% 65.1%;
     --accent: 217.2 32.6% 17.5%;
     --accent-foreground: 210 40% 98%;
     --destructive: 0 62.8% 45%;
@@ -51,26 +51,77 @@
   * {
     @apply border-border;
   }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
   body {
     @apply bg-background text-foreground antialiased;
-    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11", "ss01";
+    /* Subtle ambient background */
+    background-image:
+      radial-gradient(circle at 15% 0%, rgba(59, 130, 246, 0.06), transparent 40%),
+      radial-gradient(circle at 85% 0%, rgba(99, 102, 241, 0.05), transparent 40%),
+      radial-gradient(circle at 50% 100%, rgba(16, 185, 129, 0.04), transparent 50%);
+    background-attachment: fixed;
+    background-repeat: no-repeat;
+  }
+
+  .dark body {
+    background-image:
+      radial-gradient(circle at 15% 0%, rgba(59, 130, 246, 0.10), transparent 40%),
+      radial-gradient(circle at 85% 0%, rgba(99, 102, 241, 0.08), transparent 40%),
+      radial-gradient(circle at 50% 100%, rgba(16, 185, 129, 0.06), transparent 50%);
   }
 
   /* Custom scrollbar */
   ::-webkit-scrollbar {
-    width: 8px;
-    height: 8px;
+    width: 10px;
+    height: 10px;
   }
   ::-webkit-scrollbar-track {
     background: transparent;
   }
   ::-webkit-scrollbar-thumb {
     background: hsl(var(--border));
-    border-radius: 4px;
+    border-radius: 6px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
   }
   ::-webkit-scrollbar-thumb:hover {
-    background: hsl(var(--muted-foreground) / 0.5);
+    background: hsl(var(--muted-foreground) / 0.6);
+    background-clip: padding-box;
+    border: 2px solid transparent;
   }
+
+  /* Better focus rings */
+  :focus-visible {
+    outline: 2px solid hsl(var(--ring));
+    outline-offset: 2px;
+    border-radius: 6px;
+  }
+
+  /* Selection color */
+  ::selection {
+    background: hsl(var(--primary) / 0.18);
+    color: hsl(var(--foreground));
+  }
+}
+
+/* ==========================================
+   APP-SPECIFIC UTILITIES
+   ========================================== */
+
+/* Soft card surface used across dashboard/list pages */
+.surface {
+  @apply bg-white/80 dark:bg-slate-900/60 backdrop-blur-sm border border-slate-200/70 dark:border-slate-800/70;
+}
+
+/* Dot-grid background used in hero/empty states */
+.bg-dot-grid {
+  background-image: radial-gradient(hsl(var(--border)) 1px, transparent 1px);
+  background-size: 20px 20px;
 }
 
 /* ==========================================
@@ -136,5 +187,30 @@
   to { opacity: 1; transform: translateY(0); }
 }
 .animate-in {
-  animation: fade-in 0.2s ease-out;
+  animation: fade-in 0.25s ease-out;
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.animate-shimmer {
+  background: linear-gradient(
+    90deg,
+    hsl(var(--muted)) 0%,
+    hsl(var(--muted-foreground) / 0.15) 50%,
+    hsl(var(--muted)) 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.6s ease-in-out infinite;
+}
+
+/* Number inputs: hide native spinners for cleaner look */
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type="number"] {
+  -moz-appearance: textfield;
 }

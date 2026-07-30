@@ -8,6 +8,8 @@ import {
   requireUser,
   unauthorized,
 } from "@/lib/api-helpers";
+import { postLedgerEvent } from "@/lib/ledger";
+import { withTenant } from "@/lib/tenant";
 import { z } from "zod";
 
 interface RouteParams {
@@ -85,15 +87,36 @@ export async function POST(request: Request) {
     const body = await request.json();
     const validated = expenseSchema.parse(body);
 
-    const expense = await prisma.expense.create({
-      data: {
-        userId: user.id,
-        date: new Date(validated.date),
-        category: validated.category,
-        description: validated.description,
-        amount: validated.amount,
-        notes: validated.notes ?? null,
-      },
+    const expense = await withTenant(user.id, async (tx) => {
+      const created = await tx.expense.create({
+        data: {
+          userId: user.id,
+          date: new Date(validated.date),
+          category: validated.category,
+          description: validated.description,
+          amount: validated.amount,
+          notes: validated.notes ?? null,
+        },
+      });
+
+      // Post the EXPENSE_RECORDED ledger entry inside the same RLS tx.
+      // Because postLedgerEvent opens its own withTenant tx when no tx is
+      // supplied, we pass `tx` so the ledger rows land in the same
+      // atomic unit as the expense record.
+      await postLedgerEvent(
+        {
+          type: "EXPENSE_RECORDED",
+          expense: {
+            id: created.id,
+            userId: created.userId,
+            amount: created.amount,
+            category: created.category,
+          },
+        },
+        tx
+      );
+
+      return created;
     });
 
     return NextResponse.json(expense, { status: 201 });

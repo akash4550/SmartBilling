@@ -27,6 +27,8 @@ import {
   FileText,
   Calendar,
   Hash,
+  Settings as SettingsIcon,
+  User as UserIcon,
 } from "lucide-react";
 import { Textarea } from "@/components/ui/textarea";
 import { toast } from "sonner";
@@ -34,6 +36,8 @@ import { settingsSchema, type SettingsInput } from "@/lib/validations";
 import { LogoUploader } from "@/components/settings/logo-uploader";
 import { BrandColorPicker } from "@/components/settings/brand-color-picker";
 import { BrandingPreview } from "@/components/settings/branding-preview";
+import { PageHeader } from "@/components/ui/page-header";
+import { PageTransition } from "@/components/page-transition";
 
 type SettingsResponse = SettingsInput & {
   id: number;
@@ -173,30 +177,21 @@ export default function SettingsPage() {
 
   if (fetchError) {
     return (
-      <div className="text-center py-16">
+      <div className="text-center py-16 max-w-md mx-auto">
         <AlertCircle className="h-10 w-10 mx-auto text-red-500 mb-3" />
-        <p className="text-red-600">{fetchError}</p>
+        <p className="text-red-600 dark:text-red-400 font-medium">{fetchError}</p>
       </div>
     );
   }
 
   return (
-    <div className="max-w-2xl mx-auto space-y-6">
-      <div>
-        <div className="flex items-center gap-3 mb-2">
-          <div className="h-12 w-12 rounded-xl bg-gradient-to-br from-blue-600 to-indigo-600 flex items-center justify-center shadow-lg shadow-blue-500/25">
-            <Building2 className="h-6 w-6 text-white" />
-          </div>
-          <div>
-            <h1 className="text-3xl font-bold tracking-tight bg-gradient-to-r from-slate-900 to-slate-700 dark:from-white dark:to-slate-300 bg-clip-text text-transparent">
-              Company Settings
-            </h1>
-            <p className="text-slate-500 dark:text-slate-400 mt-1">
-              These details appear on all your invoices, PDFs, and emails to clients.
-            </p>
-          </div>
-        </div>
-      </div>
+    <PageTransition className="max-w-3xl mx-auto space-y-6">
+      <PageHeader
+        title="Settings"
+        description="Configure your company profile, branding, taxes, and invoice defaults. These details appear on every invoice, PDF, and client email."
+        icon={<SettingsIcon className="h-5 w-5" strokeWidth={2.2} />}
+        iconGradient="from-blue-600 to-indigo-600"
+      />
 
       {success && (
         <div className="flex items-center gap-3 p-4 rounded-xl bg-gradient-to-r from-emerald-50 to-green-50 dark:from-emerald-950/40 dark:to-green-950/40 border border-emerald-200 dark:border-emerald-900/50 text-emerald-700 dark:text-emerald-300 animate-in fade-in">
@@ -210,11 +205,11 @@ export default function SettingsPage() {
 
       {/* Account shortcut card */}
       <Link href="/settings/account">
-        <Card className="border-slate-200/60 dark:border-slate-800/60 hover:border-slate-300 dark:hover:border-slate-700 transition-colors cursor-pointer group">
+        <Card className="surface hover:-translate-y-0.5 hover:shadow-lg cursor-pointer group transition-all">
           <CardContent className="py-4 flex items-center justify-between">
             <div className="flex items-center gap-3">
-              <div className="h-10 w-10 rounded-lg bg-slate-100 dark:bg-slate-800 flex items-center justify-center">
-                <UserCircle className="h-5 w-5 text-slate-600 dark:text-slate-400" />
+              <div className="h-10 w-10 rounded-lg bg-gradient-to-br from-slate-600 to-slate-800 flex items-center justify-center text-white shadow-sm">
+                <UserIcon className="h-5 w-5" />
               </div>
               <div>
                 <p className="font-semibold text-sm text-slate-900 dark:text-white">Account</p>
@@ -229,7 +224,7 @@ export default function SettingsPage() {
       </Link>
 
       {/* Branding / Logo card */}
-      <Card className="border-slate-200/60 dark:border-slate-800/60">
+      <Card className="surface">
         <CardHeader className="border-b border-slate-100 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30 rounded-t-xl">
           <div className="flex items-center gap-2">
             <Palette className="h-4 w-4 text-blue-600" />
@@ -270,7 +265,7 @@ export default function SettingsPage() {
 
       {/* Business Profile card */}
       <form onSubmit={handleSubmit(onSubmit)}>
-        <Card className="border-slate-200/60 dark:border-slate-800/60">
+        <Card className="surface">
           <CardHeader className="border-b border-slate-100 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30 rounded-t-xl">
             <div className="flex items-center gap-2">
               <Receipt className="h-4 w-4 text-blue-600" />
@@ -310,12 +305,12 @@ export default function SettingsPage() {
               <Label htmlFor="companyAddress" className="flex items-center gap-1.5 text-slate-700 dark:text-slate-300">
                 <MapPin className="h-3.5 w-3.5" /> Address
               </Label>
-              <textarea
+              <Textarea
                 id="companyAddress"
                 {...register("companyAddress")}
                 rows={3}
-                className="flex w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 px-4 py-3 text-sm ring-offset-white dark:ring-offset-slate-950 placeholder:text-slate-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 dark:focus-visible:ring-blue-400 focus-visible:ring-offset-2 resize-none text-slate-900 dark:text-slate-100"
                 placeholder="Street address, city, state, ZIP, country"
+                className="resize-none min-h-[90px]"
               />
               {errors.companyAddress && <p className="text-xs text-red-600 dark:text-red-400">{errors.companyAddress.message}</p>}
             </div>
@@ -453,6 +448,6 @@ export default function SettingsPage() {
           </CardContent>
         </Card>
       </form>
-    </div>
+    </PageTransition>
   );
 }

@@ -10,6 +10,8 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { requireUser, unauthorized, jsonError } from "@/lib/api-helpers";
 import { rateLimit, requestKey } from "@/lib/rate-limit";
+import { withTenant } from "@/lib/tenant";
+import { postLedgerEvent } from "@/lib/ledger";
 import { z } from "zod";
 import { expenseSchema, DEFAULT_EXPENSE_CATEGORIES } from "@/lib/validations";
 
@@ -136,9 +138,12 @@ export async function POST(request: Request) {
       return NextResponse.json({ created: 0, skipped: parsed.data.rows.length, errors });
     }
 
-    const created = await prisma.$transaction(
-      prepared.map((e) =>
-        prisma.expense.create({
+    // Create all expenses in a single RLS-scoped transaction; post an
+    // EXPENSE_RECORDED ledger entry for each so the books balance.
+    const created = await withTenant(user.id, async (tx) => {
+      const out: Array<{ id: string; description: string; amount: number }> = [];
+      for (const e of prepared) {
+        const rec = await tx.expense.create({
           data: {
             userId: user.id,
             date: e.date,
@@ -147,10 +152,23 @@ export async function POST(request: Request) {
             amount: e.amount,
             notes: e.notes ?? null,
           },
-          select: { id: true, description: true, amount: true },
-        })
-      )
-    );
+        });
+        await postLedgerEvent(
+          {
+            type: "EXPENSE_RECORDED",
+            expense: {
+              id: rec.id,
+              userId: user.id,
+              amount: e.amount, // use the pre-validated number; Decimal type would also work but number avoids any type friction
+              category: e.category,
+            },
+          },
+          tx
+        );
+        out.push({ id: rec.id, description: rec.description, amount: e.amount });
+      }
+      return out;
+    });
 
     return NextResponse.json({
       created: created.length,

@@ -180,7 +180,15 @@ async function main() {
         taxRate: params.taxRate,
         totalAmount,
         paidAt: params.paidAt ?? null,
-        items: { create: items },
+        items: {
+          create: items.map((it) => ({
+            userId: admin.id,
+            description: it.description,
+            quantity: it.quantity,
+            price: it.price,
+            total: it.total,
+          })),
+        },
       },
     });
   }

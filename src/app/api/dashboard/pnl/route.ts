@@ -1,14 +1,14 @@
 /**
  * GET /api/dashboard/pnl?months=6
  *
- * Profit & Loss series: for each of the last N months (ending at the current
- * calendar month), compute revenue (sum of PAID invoices issued within the
- * month) and expenses (sum of expenses dated within the month). Returns
- * points for a chart plus a current-month summary.
+ * Profit & Loss series: per-month revenue (PAID invoices grouped by paidAt
+ * month) vs expenses (grouped by date month). All aggregations run in SQL
+ * via date_trunc — no in-memory scan over the full invoice/expense tables.
  */
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { requireUser, unauthorized, jsonError } from "@/lib/api-helpers";
+import { toNumber } from "@/lib/money";
 import { z } from "zod";
 
 const querySchema = z.object({
@@ -34,40 +34,49 @@ export async function GET(request: Request) {
     if (!user) return unauthorized();
 
     const { searchParams } = new URL(request.url);
-    const parsed = querySchema.safeParse({ months: searchParams.get("months") ?? undefined });
+    const parsed = querySchema.safeParse({
+      months: searchParams.get("months") ?? undefined,
+    });
     if (!parsed.success) return jsonError("Invalid query", 400);
     const { months } = parsed.data;
 
     const now = new Date();
-    // Anchor on the start of the current month so the series always ends at today's month.
     const seriesStart = addMonths(startOfMonth(now), -(months - 1));
     const seriesEnd = endOfMonth(now);
 
-    const [settings, invoices, expenses] = await Promise.all([
+    const [settings, invoiceRows, expenseRows] = await Promise.all([
       prisma.settings.upsert({
         where: { userId: user.id },
         update: {},
         create: { userId: user.id },
         select: { currency: true },
       }),
-      prisma.invoice.findMany({
-        where: {
-          userId: user.id,
-          status: "PAID",
-          paidAt: { gte: seriesStart, lte: seriesEnd },
-        },
-        select: { paidAt: true, totalAmount: true },
-      }),
-      prisma.expense.findMany({
-        where: {
-          userId: user.id,
-          date: { gte: seriesStart, lte: seriesEnd },
-        },
-        select: { date: true, amount: true, category: true },
-      }),
+      prisma.$queryRaw<Array<{ month: Date; revenue: unknown }>>`
+        SELECT date_trunc('month', "paidAt") AS month,
+               SUM("totalAmount")            AS revenue
+        FROM   "invoices"
+        WHERE  "userId"    = ${user.id}
+          AND  status      = 'PAID'
+          AND  "paidAt"   >= ${seriesStart}
+          AND  "paidAt"   <= ${seriesEnd}
+        GROUP  BY 1
+        ORDER  BY 1 ASC
+      `,
+      prisma.$queryRaw<
+        Array<{ month: Date; expenses: unknown; category: string }>
+      >`
+        SELECT date_trunc('month', "date") AS month,
+               category,
+               SUM(amount)                AS expenses
+        FROM   "expenses"
+        WHERE  "userId"    = ${user.id}
+          AND  "date"     >= ${seriesStart}
+          AND  "date"     <= ${seriesEnd}
+        GROUP  BY 1, category
+        ORDER  BY 1 ASC
+      `,
     ]);
 
-    // Build N month buckets
     const points: Array<{
       key: string;
       label: string;
@@ -75,21 +84,29 @@ export async function GET(request: Request) {
       expenses: number;
       profit: number;
     }> = [];
+    const byCategory = new Map<string, number>();
     for (let i = 0; i < months; i++) {
       const mStart = addMonths(seriesStart, i);
-      const mEnd = endOfMonth(mStart);
       const key = `${mStart.getFullYear()}-${String(mStart.getMonth() + 1).padStart(2, "0")}`;
 
-      const revenue = invoices
-        .filter((inv) => {
-          const d = inv.paidAt;
-          return d && d >= mStart && d <= mEnd;
-        })
-        .reduce((s, inv) => s + Number(inv.totalAmount), 0);
-
-      const exp = expenses
-        .filter((e) => e.date >= mStart && e.date <= mEnd)
-        .reduce((s, e) => s + Number(e.amount), 0);
+      // Match SQL-generated rows to this bucket by year+month.
+      const revenue = invoiceRows
+        .filter((r) => r.month && new Date(r.month).getTime() === mStart.getTime())
+        .reduce((s, r) => s + toNumber(r.revenue as any), 0);
+      const monthExpenseRows = expenseRows.filter(
+        (r) => r.month && new Date(r.month).getTime() === mStart.getTime()
+      );
+      const exp = monthExpenseRows.reduce(
+        (s, r) => s + toNumber(r.expenses as any),
+        0
+      );
+      for (const r of monthExpenseRows) {
+        const cat = r.category || "General";
+        byCategory.set(
+          cat,
+          (byCategory.get(cat) ?? 0) + toNumber(r.expenses as any)
+        );
+      }
 
       points.push({
         key,
@@ -100,19 +117,16 @@ export async function GET(request: Request) {
       });
     }
 
-    // Category breakdown for expenses within the window
-    const byCategory = new Map<string, number>();
-    for (const e of expenses) {
-      const cat = e.category || "General";
-      byCategory.set(cat, (byCategory.get(cat) ?? 0) + Number(e.amount));
-    }
     const categories = Array.from(byCategory.entries())
-      .map(([name, amount]) => ({ name, amount: Math.round(amount * 100) / 100 }))
+      .map(([name, amount]) => ({
+        name,
+        amount: Math.round(amount * 100) / 100,
+      }))
       .sort((a, b) => b.amount - a.amount);
 
     const totalRevenue = points.reduce((s, p) => s + p.revenue, 0);
     const totalExpenses = points.reduce((s, p) => s + p.expenses, 0);
-    const current = points[points.length - 1];
+    const current = points[points.length - 1]!;
 
     return NextResponse.json({
       currency: settings.currency || "INR",
@@ -122,7 +136,12 @@ export async function GET(request: Request) {
         revenue: Math.round(totalRevenue * 100) / 100,
         expenses: Math.round(totalExpenses * 100) / 100,
         profit: Math.round((totalRevenue - totalExpenses) * 100) / 100,
-        margin: totalRevenue > 0 ? Math.round(((totalRevenue - totalExpenses) / totalRevenue) * 1000) / 10 : 0,
+        margin:
+          totalRevenue > 0
+            ? Math.round(
+                ((totalRevenue - totalExpenses) / totalRevenue) * 1000
+              ) / 10
+            : 0,
       },
       currentMonth: current,
     });

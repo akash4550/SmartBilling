@@ -156,18 +156,20 @@ function LoginForm() {
                 />
               </div>
 
-              <div className="rounded-lg bg-gradient-to-r from-blue-50 to-indigo-50 dark:from-blue-950/40 dark:to-indigo-950/40 border border-blue-100 dark:border-blue-900/50 px-4 py-3 text-xs text-blue-700 dark:text-blue-300">
-                <div className="flex items-center gap-1.5 font-semibold mb-1">
-                  <Sparkles className="h-3.5 w-3.5" />
-                  Demo credentials (pre-filled)
+              {DEMO_EMAIL && (
+                <div className="rounded-xl bg-gradient-to-r from-blue-50 to-indigo-50 dark:from-blue-950/40 dark:to-indigo-950/40 border border-blue-100 dark:border-blue-900/50 px-4 py-3 text-xs text-blue-700 dark:text-blue-300">
+                  <div className="flex items-center gap-1.5 font-semibold mb-1">
+                    <Sparkles className="h-3.5 w-3.5" />
+                    Demo credentials (pre-filled)
+                  </div>
+                  <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 mt-1.5 font-mono">
+                    <span className="text-blue-600/70 dark:text-blue-400/70">Email:</span>
+                    <span>{DEMO_EMAIL}</span>
+                    <span className="text-blue-600/70 dark:text-blue-400/70">Password:</span>
+                    <span>{DEMO_PASSWORD}</span>
+                  </div>
                 </div>
-                <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 mt-1.5 font-mono">
-                  <span className="text-blue-600/70 dark:text-blue-400/70">Email:</span>
-                  <span>{DEMO_EMAIL}</span>
-                  <span className="text-blue-600/70 dark:text-blue-400/70">Password:</span>
-                  <span>{DEMO_PASSWORD}</span>
-                </div>
-              </div>
+              )}
             </CardContent>
 
             <CardFooter className="flex flex-col gap-3 pt-2">

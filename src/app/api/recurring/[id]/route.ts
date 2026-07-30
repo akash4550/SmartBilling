@@ -100,6 +100,7 @@ export async function PATCH(request: Request, { params }: RouteParams) {
           endDate: validated.endDate ? new Date(validated.endDate) : null,
           items: {
             create: validated.items.map((i) => ({
+              userId: user.id,
               description: i.description,
               quantity: i.quantity,
               price: i.price,

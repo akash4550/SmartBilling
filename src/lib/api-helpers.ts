@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { ZodError } from "zod";
 import { auth } from "@/lib/auth";
+import { prisma } from "@/lib/prisma";
+import crypto from "node:crypto";
 
 /**
  * Standard shape for API error responses.
@@ -15,18 +17,50 @@ export interface ApiError {
 // ============================================================
 
 /**
- * Require an authenticated NextAuth session. Returns the session user on
- * success, or `null` if the caller is unauthenticated. Handlers should
- * early-return `unauthorized()` when this returns null.
+ * Constant-time string comparison to mitigate timing attacks.
+ * Use for shared-secret comparisons (CRON_SECRET, webhook tokens).
+ */
+export function timingSafeEqual(a: string, b: string): boolean {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  if (a.length !== b.length) return false;
+  const bufA = Buffer.from(a, "utf8");
+  const bufB = Buffer.from(b, "utf8");
+  try {
+    return crypto.timingSafeEqual(bufA, bufB);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Require an authenticated NextAuth session AND:
+ *   1. Verify the user still exists in the database (catches stale JWTs
+ *      after DB resets / account deletion).
+ *   2. Verify the JWT's sessionVersion matches the current row's value
+ *      so password-changes / sign-out-everywhere can revoke outstanding
+ *      JWTs (stateless JWT cannot otherwise be revoked).
  *
- * Usage (at the very top of a protected handler):
- *   const user = await requireUser();
- *   if (!user) return unauthorized();
+ * Returns the session user on success, or `null` on failure. Handlers
+ * should early-return `unauthorized()` when this returns null.
  */
 export async function requireUser() {
   try {
     const session = await auth();
-    if (!session?.user) return null;
+    if (!session?.user?.id) return null;
+    const user = await prisma.user.findUnique({
+      where: { id: session.user.id },
+      select: { id: true, sessionVersion: true },
+    });
+    if (!user) return null;
+    // JWT sessionVersion mismatch → token was revoked; force sign-in.
+    if (
+      typeof (session.user as { sessionVersion?: number }).sessionVersion ===
+        "number" &&
+      (session.user as { sessionVersion: number }).sessionVersion !==
+        user.sessionVersion
+    ) {
+      return null;
+    }
     return session.user;
   } catch {
     return null;
@@ -52,7 +86,8 @@ export function unauthorized() {
  * Works with both Zod v3 (.errors) and Zod v4 (.issues) by normalizing.
  */
 export function formatZodError(error: ZodError) {
-  const issues = (error.issues ?? (error as unknown as { errors: unknown[] }).errors) as Array<{
+  const issues = (error.issues ??
+    (error as unknown as { errors: unknown[] }).errors) as Array<{
     path: Array<string | number | symbol>;
     message: string;
   }>;

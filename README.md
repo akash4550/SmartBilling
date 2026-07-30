@@ -17,6 +17,69 @@ A modern, full-stack invoicing and billing application built with:
 
 ---
 
+## 🏗️ System Architecture & Concurrency Model
+
+SmartBill is engineered as a stateless, serverless-ready SaaS (works on Vercel Node runtimes, Docker, or any Node host) with strict multi-tenant isolation and idempotent write paths. The diagram below illustrates the critical concurrent flows — webhook fan-in, payment-session creation, and cron-driven recurring generation — and the mechanisms that keep them correct.
+
+```mermaid
+flowchart TD
+    subgraph Edge["Edge / Public Internet"]
+        Browser["Client Browser<br/>(view/[id] & portal/[token])"]
+        StripeWH["Stripe Webhook<br/>(checkout.session.completed)"]
+        RazorWH["Razorpay Webhook<br/>(payment.captured)"]
+        Cron["Vercel Cron<br/>(daily 09:00 IST)"]
+    end
+
+    subgraph App["Next.js 16 (Node runtime)"]
+        Rate["Rate Limiter<br/><b>Memory</b> default<br/><b>Upstash Redis</b> when<br/>UPSTASH_REDIS_REST_URL set"]
+        Api["Route Handlers /api/*<br/>(tenant-scoped by requireUser())"]
+        PayStripe["/pay (Stripe)"]
+        PayRazor["/pay-razorpay (Razorpay)"]
+        WHStripe["/webhooks/stripe<br/>(signature verified)"]
+        WHRazor["/webhooks/razorpay<br/>(signature verified)"]
+        CronGen["/cron/generate-recurring<br/>(CRON_SECRET, timingSafeEqual)"]
+        CronRem["/cron/send-reminders<br/>(CRON_SECRET, timingSafeEqual)"]
+        AtomPay["markInvoicePaid()"]
+    end
+
+    subgraph Data["PostgreSQL (Prisma)"]
+        Inv[(invoices)]
+        Rec[(recurring_profiles)]
+        AdvLocks["pg_advisory_xact_lock<br/>(per-profile)"]
+    end
+
+    Browser --> Rate --> Api
+    StripeWH --> Rate --> WHStripe --> AtomPay
+    RazorWH --> Rate --> WHRazor --> AtomPay
+    Cron --> Rate --> CronGen
+    Cron --> Rate --> CronRem
+
+    Api --> PayStripe
+    Api --> PayRazor
+
+    PayStripe -. "pending_ reservation<br/>(idempotent claim)" .-> Inv
+    PayRazor  -. "pending_ reservation<br/>(idempotent claim)" .-> Inv
+    PayStripe --> Stripe["Stripe API"]
+    PayRazor --> Razorpay["Razorpay API"]
+
+    AtomPay -- "UPDATE invoices WHERE status NOT IN ('PAID','VOID')<br/>→ 1 winner; activity + email post-commit" --> Inv
+
+    CronGen -->|"SELECT due profiles"| Rec
+    CronGen -->|"transaction + advisory lock"| AdvLocks --> Inv
+
+    classDef critical fill:#fde68a,stroke:#b45309,color:#000
+    class AtomPay,AdvLocks,Rate critical
+```
+
+### Why these mechanisms?
+
+- **`BigInt` paise arithmetic with Prisma `Decimal` ROUND_HALF_UP** — IEEE-754 binary floats cannot represent `0.1` or `0.07` exactly; summing thousands of line items in JS `number` produces off-by-one-paisa errors that surface as mismatched totals on receipts and tax filings. We keep all money math in integer subunits (`BigInt`) and only convert to float at the display/boundary layer after rounding is finalized. Stripe and Razorpay both mandate ROUND_HALF_UP for subunit conversion.
+- **Postgres `pg_advisory_xact_lock` for recurring generation** — application-level mutexes (in-memory sets, Redis locks) break across serverless replicas and cold starts. A transaction-scoped advisory lock is held for the duration of the invoice-creation transaction, serializes at the database level (no race even across multiple app instances), and auto-releases on commit/rollback so a crashed worker never wedges a profile.
+- **`pending_` reservation markers for payment session creation** — wrapping `stripe.checkout.sessions.create` in a transaction is dangerous because a Stripe API call inside a long-running DB transaction holds locks and can leave orphaned sessions on network failure. Instead we do a cheap `UPDATE ... WHERE session_id IS NULL` with a short-lived `pending_<ts>_<rand>` marker, call Stripe, then finalize with the real session id. Concurrent double-clicks get `count === 0`, reload the existing (open) session, and return it without leaking a Stripe session.
+- **Atomic conditional `UPDATE ... WHERE status NOT IN ('PAID','VOID')` for mark-as-paid** — the classic webhook double-delivery problem is solved with a single DML statement: exactly one concurrent webhook sees `matched === 1` and proceeds to write activity logs + fire the receipt email; all replays hit `matched === 0` and return silently. VOID is excluded from the guard so a late/forged webhook cannot resurrect a voided invoice.
+
+---
+
 ## 🌐 Live Demo
 
 Deployed on Vercel: [**https://smart-bill-theta.vercel.app/login**](https://smart-bill-theta.vercel.app/login)
@@ -243,3 +306,77 @@ Then run:
 ```bash
 npx tsx prisma/seed.ts
 ```
+
+---
+
+## 🛡️ Enterprise Hardening (Batch 5)
+
+### 1. Row-Level Security (RLS)
+
+Application-level `where: { userId }` clauses are defense-in-depth; the real enforcement sits in Postgres. We create a restricted role `app_user` (NOINHERIT, NOBYPASSRLS) whose queries against tenant tables are filtered by `current_setting('app.current_user_id')`. The `withTenant(userId, fn)` helper opens an interactive transaction, runs:
+
+```sql
+SET LOCAL ROLE app_user;
+SET LOCAL app.current_user_id = '<userId>';
+```
+and asserts both took effect (fail-closed if SET ROLE fails) before running the callback. `InvoiceItem` and `RecurringItem` carry a denormalized `userId` so the policies don't require FK joins. SET LOCAL auto-resets at transaction end so there's zero risk of leaking the role to subsequent queries on a pooled connection.
+
+To apply the RLS role + policies on a fresh database:
+```bash
+psql "$DATABASE_URL" -f prisma/rls-setup.sql
+```
+
+This is idempotent (IF NOT EXISTS + DROP POLICY IF EXISTS). Public CUID-protected routes (`/view/:id`, `/pay`, `/pay-razorpay`, webhooks) run as the superuser against non-tenant scoped queries or against specific CUID-known rows — they don't need RLS because they don't enumerate tenants. All admin financial writes (invoice create/edit/delete/duplicate, recurring generation, mark-paid) go through `withTenant`.
+
+### 2. Async Webhook Ingestion with SKIP LOCKED
+
+Previously, Stripe/Razorpay/Resend webhooks did all DB work (mark PAID, update checkout session ids, write activity rows, send receipt emails) on the request thread. A burst of payment events would tie up serverless DB connections and drop deliveries. Now:
+
+1. **Thin edge** — verify HMAC signature (fail-closed in production, as before), INSERT raw payload into the append-only `WebhookIngestion` table, return **202 Accepted** in <50ms. Duplicate `(provider, providerEventId)` inserts are silently absorbed (idempotent retries).
+2. **Decoupled worker** (`/api/cron/process-webhooks`, every minute via Vercel Cron) claims rows via `SELECT ... FOR UPDATE SKIP LOCKED` (concurrent workers don't fight), dispatches to provider-specific processors, marks DONE or schedules exponential-backoff retries (`5s * 2^n + jitter`). After 5 failed attempts → **DLQ** status for manual review. Stale PROCESSING rows (worker crashed mid-handle) are reaped on each invocation.
+
+Raw bodies are retained for 90 days for forensic audit.
+
+```mermaid
+flowchart LR
+    Stripe[Stripe] --> EdgeSig[Edge: verify HMAC]
+    Razor[Razorpay] --> EdgeSig
+    Resend[Resend] --> EdgeSig
+    EdgeSig -->|INSERT rawBody<br/>202 Accepted| Q[(WebhookIngestion)]
+    Cron[Vercel Cron<br/>* * * * *] -->|SKIP LOCKED claim| Q
+    Cron -->|dispatch| Proc[Provider processors]
+    Proc -->|mark DONE| Q
+    Proc -->|error<br/>backoff 5s·2^n| Q
+    Proc -. 5 fails .-> DLQ[DLQ review]
+    Proc --> Inv[Invoice PAID<br/>activity logs]
+```
+
+### 3. Immutable Double-Entry Financial Ledger
+
+Every state change that moves money now produces a balanced set of double-entry postings in an append-only `LedgerEntry` table with a SHA-256 hash chain. This gives us three guarantees the application layer cannot provide on its own:
+
+1. **Immutability at the database layer.** `app_user` (the role every tenant query runs as via `withTenant()`) holds only `SELECT` and `INSERT` on `ledger_entries` — `UPDATE` and `DELETE` are explicitly `REVOKE`d. Voiding, refunding, or "un-marking" a payment is modelled as a new reversing entry, never a mutation of history.
+2. **Balanced-books invariant enforced in Postgres.** An `AFTER INSERT ... FOR EACH STATEMENT` trigger sums debits and credits per `eventId` across the whole table and raises an exception if they differ in integer paise. An unbalanced insert cannot commit — even if there is a bug in application code.
+3. **Tamper-evident hash chain.** Every entry carries `entryHash = SHA256(prevEntryHash | canonical_entry_bytes)` where the canonical form is a pipe-delimited record `eventId|eventType|account|side|amountPaise|invoiceId|expenseId|currency`. The user's `lastLedgerEntryHash` / `lastLedgerEntryId` tail pointer is updated in the same transaction, serialized by a `pg_advisory_xact_lock` keyed per user, so concurrent writes cannot fork the chain. `verifyUserLedger(userId)` walks the chain from `GENESIS_HASH`, recomputes every hash, rechecks per-event balance, verifies the tail pointer, and returns account balances.
+
+**Accounts (paise balances).**
+
+| Account           | Type          | Debit when…                       | Credit when…              |
+|-------------------|---------------|-----------------------------------|---------------------------|
+| ACCOUNTS_RECEIVABLE | asset        | Invoice issued (owed to you)      | Payment received / voided |
+| REVENUE           | income        | Voided (reversal)                 | Invoice issued            |
+| DISCOUNT_CONTRA   | contra-rev    | Discount on invoice               | Void reverses discount    |
+| TAX_PAYABLE       | liability     | Voided (reversal)                 | GST/VAT on invoice        |
+| CASH              | asset         | Payment received                  | Expense paid / refund     |
+| EXPENSES          | expense       | Expense recorded                  | (no credit events today)  |
+
+**Events posted:** `INVOICE_ISSUED` (PENDING/PAID create, send DRAFT→PENDING, recurring autoSend, draft→issued edit); `INVOICE_PAID` (mark paid, Stripe/Razorpay settle); `INVOICE_VOIDED` (void — reverses issuance *and* payment if previously PAID); `PAYMENT_REVERSED` (PAID→PENDING/DRAFT un-mark); `EXPENSE_RECORDED` (expense create, CSV import). DRAFT creates/duplicates do not post (no economic event yet).
+
+**Reconciliation.** `GET /api/admin/ledger-verify` returns the verification result plus an AR-vs-open-PENDING-invoices cross-check so the Settings page can confirm the books tie out. The P&L and dashboard aggregates currently read from `Invoice`/`Expense` tables (projections over the ledger); switching them to read balances from the ledger is a follow-up.
+
+To apply the ledger DDL on a fresh database (in addition to `rls-setup.sql`):
+```bash
+psql "$DATABASE_URL" -f prisma/ledger.sql
+```
+
+On an existing database, `backfillLedger()` is idempotent — it posts `INVOICE_ISSUED` for every non-DRAFT invoice that has no issuance entry, plus `INVOICE_PAID`/`INVOICE_VOIDED`/`EXPENSE_RECORDED` as current state indicates.
