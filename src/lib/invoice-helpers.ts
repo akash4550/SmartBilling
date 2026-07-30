@@ -58,8 +58,9 @@ function formatAmountForMessage(amount: unknown, currency = "INR"): string {
 }
 
 /**
- * Mark an invoice PAID — idempotent and concurrency-safe. Posts an
- * INVOICE_PAID ledger entry (Dr CASH / Cr ACCOUNTS_RECEIVABLE) inside the
+ * Mark an invoice PAID — idempotent and concurrency-safe. If the invoice is
+ * currently DRAFT, posts an INVOICE_ISSUED first (so AR is recognized)
+ * followed by INVOICE_PAID (Dr CASH / Cr ACCOUNTS_RECEIVABLE) inside the
  * same atomic transaction.
  *
  * Returns the updated Invoice on the winning transition; null if already
@@ -69,12 +70,14 @@ export async function markInvoicePaid(
   invoiceId: string,
   opts: MarkPaidOptions = {}
 ): Promise<Invoice | null> {
+  // Load items in case we need to post INVOICE_ISSUED (DRAFT→PAID).
   const pre = await prisma.invoice.findUnique({
     where: { id: invoiceId },
-    select: { id: true, userId: true, status: true },
+    include: { items: true },
   });
   if (!pre) return null;
   const ownerId = opts.actorUserId ?? pre.userId;
+  const wasDraft = pre.status === "DRAFT";
 
   type RunResult = {
     invoice: Invoice;
@@ -125,6 +128,29 @@ export async function markInvoicePaid(
       where: { id: invoiceId },
     });
     if (!updated) return null;
+
+    // If the invoice was DRAFT we need to recognize AR first (INVOICE_ISSUED)
+    // before posting INVOICE_PAID so the books stay balanced.
+    if (wasDraft) {
+      await postLedgerEvent(
+        {
+          type: "INVOICE_ISSUED",
+          invoice: {
+            id: updated.id,
+            userId: updated.userId,
+            items: pre.items.map((it) => ({
+              description: it.description,
+              quantity: it.quantity,
+              price: Number(it.price),
+            })),
+            taxRate: Number(pre.taxRate),
+            discountType: pre.discountType,
+            discountValue: pre.discountValue != null ? Number(pre.discountValue) : null,
+          },
+        },
+        tx
+      );
+    }
 
     // Ledger entry: Dr CASH / Cr ACCOUNTS_RECEIVABLE.
     await postLedgerEvent(
@@ -200,8 +226,10 @@ export async function markInvoicePaid(
 
 /**
  * Void an invoice. Idempotent (no-op if already VOID) and concurrency-safe.
- * Posts INVOICE_VOIDED ledger entries that reverse the original issuance
- * (and reverse any payment ledger entry if the invoice was PAID).
+ * For PENDING/PAID invoices, posts INVOICE_VOIDED ledger entries that reverse
+ * the original issuance (and reverse any payment ledger entry if PAID).
+ * DRAFT invoices have never been economically issued, so we just flip
+ * status → VOID with no ledger postings.
  */
 export async function voidInvoice(
   invoiceId: string,
@@ -217,6 +245,7 @@ export async function voidInvoice(
   }
   const ownerId = opts.actorUserId ?? pre.userId;
   const wasPaid = pre.status === "PAID";
+  const wasDraft = pre.status === "DRAFT";
 
   const run = async (tx: Prisma.TransactionClient): Promise<Invoice> => {
     const updated = await tx.invoice.update({
@@ -225,26 +254,29 @@ export async function voidInvoice(
       include: { client: true, items: true },
     });
 
-    // Post reversing ledger entry for the issuance (and payment if PAID).
-    await postLedgerEvent(
-      {
-        type: "INVOICE_VOIDED",
-        invoice: {
-          id: updated.id,
-          userId: updated.userId,
-          items: pre.items.map((it) => ({
-            description: it.description,
-            quantity: it.quantity,
-            price: Number(it.price),
-          })),
-          taxRate: Number(pre.taxRate),
-          discountType: pre.discountType,
-          discountValue: pre.discountValue != null ? Number(pre.discountValue) : null,
-          paidAmount: wasPaid ? pre.totalAmount : null,
+    // Only post reversing ledger entries if the invoice had been issued
+    // (PENDING/PAID). DRAFTs were never on the ledger.
+    if (!wasDraft) {
+      await postLedgerEvent(
+        {
+          type: "INVOICE_VOIDED",
+          invoice: {
+            id: updated.id,
+            userId: updated.userId,
+            items: pre.items.map((it) => ({
+              description: it.description,
+              quantity: it.quantity,
+              price: Number(it.price),
+            })),
+            taxRate: Number(pre.taxRate),
+            discountType: pre.discountType,
+            discountValue: pre.discountValue != null ? Number(pre.discountValue) : null,
+            paidAmount: wasPaid ? pre.totalAmount : null,
+          },
         },
-      },
-      tx
-    );
+        tx
+      );
+    }
 
     return updated;
   };
@@ -260,7 +292,9 @@ export async function voidInvoice(
     invoiceId,
     userId: ownerId,
     type: "VOIDED",
-    message: "Invoice voided (cancelled without payment)" + (wasPaid ? " — payment reversed in ledger" : ""),
+    message: wasDraft
+      ? "Draft invoice voided (deleted)"
+      : "Invoice voided (cancelled without payment)" + (wasPaid ? " — payment reversed in ledger" : ""),
     ip: opts.ip ?? null,
   });
 

@@ -478,21 +478,29 @@ export async function PATCH(request: Request, { params }: RouteParams) {
         );
       }
 
-      if (becomingVoid) {
-        // Reversing issuance uses the *new* (edited) items/totals since
-        // that's what was sitting in AR. If the invoice was PAID going into
-        // the edit, also reverse the payment.
+      if (becomingVoid && prevStatus !== "DRAFT") {
+        // Reverse the issuance (and payment if previously PAID). Use the
+        // pre-edit items/discount/tax because those are the values the
+        // INVOICE_ISSUED event was originally posted with; reversing with
+        // different totals would leave a residual balance in AR/Revenue/
+        // TaxPayable. (If the invoice was DRAFT nothing was ever issued,
+        // so no ledger reversal is needed.)
+        const wasPaid = prevStatus === "PAID";
         await postLedgerEvent(
           {
             type: "INVOICE_VOIDED",
             invoice: {
               id: updated.id,
               userId: user.id,
-              items: newItems,
-              taxRate: validated.taxRate,
-              discountType: validated.discountType,
-              discountValue: validated.discountValue ?? null,
-              paidAmount: prevStatus === "PAID" ? existing.totalAmount : null,
+              items: existing.items.map((it) => ({
+                description: it.description,
+                quantity: it.quantity,
+                price: Number(it.price),
+              })),
+              taxRate: Number(existing.taxRate),
+              discountType: existing.discountType,
+              discountValue: existing.discountValue != null ? Number(existing.discountValue) : null,
+              paidAmount: wasPaid ? existing.totalAmount : null,
             },
           },
           tx
