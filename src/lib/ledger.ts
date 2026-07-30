@@ -297,6 +297,63 @@ function newEventId(): string {
   return "evt_" + crypto.randomBytes(12).toString("hex");
 }
 
+function advisoryKeyFor(userId: string): bigint {
+  // Per-user advisory lock namespace. FNV-1a 32-bit folded into the low
+  // 32 bits of a 64-bit key with a fixed high-32 namespace.
+  let h = 0x811c9dc5;
+  for (let i = 0; i < userId.length; i++) {
+    h ^= userId.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  const ns = BigInt(1397772900);
+  return ns * BigInt(0x100000000) + BigInt(h >>> 0);
+}
+
+/** Postgres SQLSTATEs that indicate a transient retryable failure. */
+const RETRYABLE_SQLSTATES = new Set([
+  "40P01", // deadlock_detected
+  "55P03", // lock_not_available
+  "40001", // serialization_failure
+  "08006", // connection_failure
+  "08001", // sqlclient_unable_to_establish_sqlconnection
+  "57P01", // admin_shutdown
+]);
+
+function isRetryablePgError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const code = (err as { code?: string }).code;
+  if (typeof code === "string" && RETRYABLE_SQLSTATES.has(code)) return true;
+  const msg = err instanceof Error ? err.message : String(err);
+  // pg-protocol sometimes surfaces these without a code on prepared tx abort.
+  return /deadlock|could not obtain lock|serialization failure|canceling statement due to statement timeout/i.test(
+    msg
+  );
+}
+
+async function retryWithBackoff<T>(
+  fn: () => Promise<T>,
+  opts: { maxRetries?: number; baseMs?: number; label?: string } = {}
+): Promise<T> {
+  const { maxRetries = 4, baseMs = 20, label = "ledger" } = opts;
+  let lastErr: unknown = null;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (attempt === maxRetries || !isRetryablePgError(err)) throw err;
+      const jitter = Math.floor(Math.random() * 20);
+      const waitMs = baseMs * Math.pow(2, attempt) + jitter;
+      console.warn(
+        `[${label}] transient error on attempt ${attempt + 1}, retrying in ${waitMs}ms:`,
+        err instanceof Error ? err.message : String(err)
+      );
+      await new Promise((r) => setTimeout(r, waitMs));
+    }
+  }
+  throw lastErr;
+}
+
 export interface PostResult {
   eventId: string;
   entryCount: number;
@@ -305,157 +362,259 @@ export interface PostResult {
   lastEntryHash: string;
 }
 
-/**
- * Post a balanced ledger event. Runs inside withTenant() (RDS-enforced).
- * Accepts an existing `tx` to support callers already inside a
- * withTenant transaction.
- */
-export async function postLedgerEvent(
-  event: LedgerEventInput,
-  tx?: Prisma.TransactionClient
-): Promise<PostResult> {
+export interface BatchPostResult {
+  results: PostResult[];
+  totalEntryCount: number;
+  lastEntryId: string;
+  lastEntryHash: string;
+}
+
+interface PreparedEvent {
+  userId: string;
+  eventId: string;
+  eventType: LedgerEventInput["type"];
+  entries: EntryDraft[];
+  invoiceId: string | null;
+  expenseId: string | null;
+  currency: string;
+  note: string | null;
+  totalDebits: bigint;
+}
+
+function prepareEvent(event: LedgerEventInput): PreparedEvent {
   const userId =
     event.type === "EXPENSE_RECORDED" ? event.expense.userId : event.invoice.userId;
+  const built = buildEntriesFor(event);
+  const { totalDebits } = assertBalanced(built.entries);
+  return {
+    userId,
+    eventId: newEventId(),
+    eventType: event.type,
+    entries: built.entries,
+    invoiceId: built.invoiceId,
+    expenseId: built.expenseId,
+    currency: built.currency,
+    note: built.note ?? null,
+    totalDebits,
+  };
+}
 
-  const { entries, invoiceId, expenseId, currency, note } = buildEntriesFor(event);
-  const { totalDebits } = assertBalanced(entries);
-
-  const eventId = newEventId();
-  const eventType = event.type;
-
-  const run = async (txClient: Prisma.TransactionClient): Promise<PostResult> => {
-    // Serialize chain appends per-user via a Postgres advisory lock. Use a
-    // signed 32-bit FNV-1a of userId combined with a fixed namespace (1397)
-    // for the first 32 bits; fits in int64 without overflow.
-    let h = 0x811c9dc5;
-    for (let i = 0; i < userId.length; i++) {
-      h ^= userId.charCodeAt(i);
-      h = Math.imul(h, 0x01000193);
+/**
+ * Build and insert ledger rows for a set of prepared events under a single
+ * per-user advisory lock. Caller MUST be running inside the RLS tenant
+ * tx (withTenant/withService+withTenant). Returns per-event PostResults
+ * plus the new tail pointer.
+ */
+async function appendPreparedEvents(
+  txClient: Prisma.TransactionClient,
+  userId: string,
+  prepared: PreparedEvent[]
+): Promise<BatchPostResult> {
+  if (prepared.length === 0) {
+    throw new Error("appendPreparedEvents: empty event list");
+  }
+  for (const p of prepared) {
+    if (p.userId !== userId) {
+      throw new Error(
+        `appendPreparedEvents: all events must belong to userId=${userId}, got ${p.userId}`
+      );
     }
-    // Construct a 64-bit advisory lock key without BigInt literals
-    // (tsconfig targets ES2017 which lacks them). Namespace in the high
-    // 32 bits, FNV-1a(userId) in the low 32 bits.
-    const ns = BigInt(1397772900);
-    const lo = BigInt(h >>> 0);
-    const lockKey = (ns * BigInt(0x100000000)) + lo;
-    await txClient.$executeRawUnsafe(
-      `SELECT pg_advisory_xact_lock(${lockKey.toString()})`
-    );
+  }
 
-    const userRow = await txClient.user.findUnique({
-      where: { id: userId },
-      select: { lastLedgerEntryHash: true, lastLedgerEntryId: true },
-    });
-    // Also defend against lastLedgerEntryHash being out of sync with the
-    // actual tail — use MAX(entryIndex) and the last entry's hash.
-    const lastEntry = await txClient.ledgerEntry.findFirst({
-      where: { userId },
-      orderBy: { entryIndex: "desc" },
-      select: { entryHash: true, entryIndex: true },
-    });
-    const hash = lastEntry?.entryHash ?? userRow?.lastLedgerEntryHash ?? null;
-    const idx = lastEntry?.entryIndex ?? 0;
-    let prevHash = hash ?? GENESIS_HASH;
-    let nextIndex = Number(idx ?? 0) + 1;
+  const lockKey = advisoryKeyFor(userId);
+  await txClient.$executeRawUnsafe(
+    `SELECT pg_advisory_xact_lock(${lockKey.toString()})`
+  );
 
-    // Compute hashes for each entry in the balanced set.
-    const rows: Array<{
-      id: string;
-      userId: string;
-      eventId: string;
-      eventType: string;
-      account: Account;
-      side: "DEBIT" | "CREDIT";
-      amountPaise: bigint;
-      prevEntryHash: string;
-      entryHash: string;
-      entryIndex: number;
-      invoiceId: string | null;
-      expenseId: string | null;
-      currency: string;
-      note: string | null;
-      // Prisma wants BigInt for the column; it serializes to a pg bigint.
-    }> = [];
+  const userRow = await txClient.user.findUnique({
+    where: { id: userId },
+    select: { lastLedgerEntryHash: true, lastLedgerEntryId: true },
+  });
+  const lastEntry = await txClient.ledgerEntry.findFirst({
+    where: { userId },
+    orderBy: { entryIndex: "desc" },
+    select: { entryHash: true, entryIndex: true },
+  });
+  const hash = lastEntry?.entryHash ?? userRow?.lastLedgerEntryHash ?? null;
+  let prevHash = hash ?? GENESIS_HASH;
+  let nextIndex = Number(lastEntry?.entryIndex ?? 0) + 1;
 
-    for (const e of entries) {
+  type Row = {
+    id: string;
+    userId: string;
+    eventId: string;
+    eventType: string;
+    account: Account;
+    side: "DEBIT" | "CREDIT";
+    amountPaise: bigint;
+    prevEntryHash: string;
+    entryHash: string;
+    entryIndex: number;
+    invoiceId: string | null;
+    expenseId: string | null;
+    currency: string;
+    note: string | null;
+  };
+  const allRows: Row[] = [];
+  const perEvent: PostResult[] = [];
+
+  for (const p of prepared) {
+    const firstId = "clg_" + crypto.randomBytes(10).toString("hex");
+    // We don't know the last id until after the loop; track placeholder.
+    let firstIdx = nextIndex;
+    let eventRowCount = 0;
+    for (const e of p.entries) {
       const serialized = serializeForHash({
-        eventId,
-        eventType,
+        eventId: p.eventId,
+        eventType: p.eventType,
         account: e.account,
         side: e.side,
         amountPaise: e.amountPaise,
-        invoiceId,
-        expenseId,
-        currency,
+        invoiceId: p.invoiceId,
+        expenseId: p.expenseId,
+        currency: p.currency,
       });
       const entryHash = sha256Hex(prevHash + "|" + serialized);
-      rows.push({
-        id: "clg_" + crypto.randomBytes(10).toString("hex"),
+      const id =
+        eventRowCount === 0
+          ? firstId
+          : "clg_" + crypto.randomBytes(10).toString("hex");
+      allRows.push({
+        id,
         userId,
-        eventId,
-        eventType,
+        eventId: p.eventId,
+        eventType: p.eventType,
         account: e.account,
         side: e.side,
         amountPaise: e.amountPaise,
         prevEntryHash: prevHash,
         entryHash,
         entryIndex: nextIndex,
-        invoiceId,
-        expenseId,
-        currency,
-        note: note ?? null,
+        invoiceId: p.invoiceId,
+        expenseId: p.expenseId,
+        currency: p.currency,
+        note: p.note,
       });
       prevHash = entryHash;
       nextIndex++;
+      eventRowCount++;
     }
-
-    // Bulk insert the balanced set in a single statement for efficiency
-    // (createMany is significantly faster than N create calls).
-    // Prisma's createMany does not return inserted rows; we already
-    // generated CUIDs client-side, so last entry id is known.
-    //
-    // NOTE: Prisma serializes BigInt to the bigint Postgres type directly.
-    await txClient.ledgerEntry.createMany({
-      data: rows.map((r) => ({
-        id: r.id,
-        userId: r.userId,
-        eventId: r.eventId,
-        eventType: r.eventType as unknown as import("@prisma/client").LedgerEventType,
-        account: r.account as unknown as import("@prisma/client").AccountType,
-        side: r.side as unknown as import("@prisma/client").EntrySide,
-        amountPaise: r.amountPaise,
-        prevEntryHash: r.prevEntryHash,
-        entryHash: r.entryHash,
-        entryIndex: r.entryIndex,
-        invoiceId: r.invoiceId,
-        expenseId: r.expenseId,
-        currency: r.currency,
-        note: r.note,
-      })),
-    });
-
-    const last = rows[rows.length - 1];
-
-    // Advance user tail pointer.
-    await txClient.user.update({
-      where: { id: userId },
-      data: {
-        lastLedgerEntryHash: last.entryHash,
-        lastLedgerEntryId: last.id,
-      },
-    });
-
-    return {
-      eventId,
-      entryCount: rows.length,
-      totalPaise: totalDebits,
+    const last = allRows[allRows.length - 1];
+    perEvent.push({
+      eventId: p.eventId,
+      entryCount: eventRowCount,
+      totalPaise: p.totalDebits,
       lastEntryId: last.id,
       lastEntryHash: last.entryHash,
-    };
+    });
+    void firstIdx;
+  }
+
+  if (allRows.length === 0) {
+    throw new Error("appendPreparedEvents: no rows generated");
+  }
+
+  // Single bulk INSERT for the entire batch (1 round trip to the DB).
+  await txClient.ledgerEntry.createMany({
+    data: allRows.map((r) => ({
+      id: r.id,
+      userId: r.userId,
+      eventId: r.eventId,
+      eventType: r.eventType as unknown as import("@prisma/client").LedgerEventType,
+      account: r.account as unknown as import("@prisma/client").AccountType,
+      side: r.side as unknown as import("@prisma/client").EntrySide,
+      amountPaise: r.amountPaise,
+      prevEntryHash: r.prevEntryHash,
+      entryHash: r.entryHash,
+      entryIndex: r.entryIndex,
+      invoiceId: r.invoiceId,
+      expenseId: r.expenseId,
+      currency: r.currency,
+      note: r.note,
+    })),
+  });
+
+  const lastRow = allRows[allRows.length - 1];
+  await txClient.user.update({
+    where: { id: userId },
+    data: {
+      lastLedgerEntryHash: lastRow.entryHash,
+      lastLedgerEntryId: lastRow.id,
+    },
+  });
+
+  return {
+    results: perEvent,
+    totalEntryCount: allRows.length,
+    lastEntryId: lastRow.id,
+    lastEntryHash: lastRow.entryHash,
+  };
+}
+
+/**
+ * Post a single balanced ledger event. Runs inside withTenant() (RLS).
+ * Accepts an existing `tx` to compose with outer writes. On transient
+ * lock/deadlock errors, retries with exponential backoff.
+ */
+export async function postLedgerEvent(
+  event: LedgerEventInput,
+  tx?: Prisma.TransactionClient
+): Promise<PostResult> {
+  const prepared = prepareEvent(event);
+  const userId = prepared.userId;
+
+  const doPost = async (txClient: Prisma.TransactionClient): Promise<PostResult> => {
+    const batch = await appendPreparedEvents(txClient, userId, [prepared]);
+    return batch.results[0];
   };
 
-  if (tx) return withTenant(userId, run, { tx });
-  return withTenant(userId, run);
+  // If a tx was supplied, we are already inside the caller's transaction;
+  // do not wrap in retry (retrying requires a fresh tx). Lock waits on
+  // pg_advisory_xact_lock are fine since the advisory lock is per-user
+  // and held only for the duration of the short append.
+  if (tx) {
+    return withTenant(userId, (t) => doPost(t), { tx });
+  }
+  return retryWithBackoff(
+    () => withTenant(userId, doPost),
+    { label: "postLedgerEvent" }
+  );
+}
+
+/**
+ * Post multiple ledger events for the SAME userId under a single
+ * advisory lock and a single bulk INSERT. This is the high-throughput
+ * path used by bulk imports (CSV expense import) and recurring batch
+ * generation — avoids acquiring/releasing the chain lock N times.
+ *
+ * Retries on transient lock contention. ALL events must belong to the
+ * same user; mixed-user batches throw.
+ */
+export async function postLedgerEvents(
+  events: readonly LedgerEventInput[],
+  tx?: Prisma.TransactionClient
+): Promise<BatchPostResult> {
+  if (events.length === 0) {
+    throw new Error("postLedgerEvents: empty event list");
+  }
+  const prepared = events.map(prepareEvent);
+  const userId = prepared[0].userId;
+  for (const p of prepared) {
+    if (p.userId !== userId) {
+      throw new Error("postLedgerEvents: all events must be for the same userId");
+    }
+  }
+
+  const doPost = (txClient: Prisma.TransactionClient) =>
+    appendPreparedEvents(txClient, userId, prepared);
+
+  if (tx) {
+    return withTenant(userId, (t) => doPost(t), { tx });
+  }
+  return retryWithBackoff(
+    () => withTenant(userId, doPost),
+    { label: "postLedgerEvents" }
+  );
 }
 
 // ============================================================

@@ -11,7 +11,8 @@ import { prisma } from "@/lib/prisma";
 import { requireUser, unauthorized, jsonError } from "@/lib/api-helpers";
 import { rateLimit, requestKey } from "@/lib/rate-limit";
 import { withTenant } from "@/lib/tenant";
-import { postLedgerEvent } from "@/lib/ledger";
+import { postLedgerEvents } from "@/lib/ledger";
+import type { LedgerEventInput } from "@/lib/ledger";
 import { z } from "zod";
 import { expenseSchema, DEFAULT_EXPENSE_CATEGORIES } from "@/lib/validations";
 
@@ -138,10 +139,13 @@ export async function POST(request: Request) {
       return NextResponse.json({ created: 0, skipped: parsed.data.rows.length, errors });
     }
 
-    // Create all expenses in a single RLS-scoped transaction; post an
-    // EXPENSE_RECORDED ledger entry for each so the books balance.
+    // Create all expenses in a single RLS-scoped transaction, then post
+    // all EXPENSE_RECORDED ledger entries in ONE bulk append under a
+    // single per-user advisory lock (avoids N lock roundtrips → removes
+    // the chain-contention bottleneck for bulk imports).
     const created = await withTenant(user.id, async (tx) => {
       const out: Array<{ id: string; description: string; amount: number }> = [];
+      const events: LedgerEventInput[] = [];
       for (const e of prepared) {
         const rec = await tx.expense.create({
           data: {
@@ -153,19 +157,19 @@ export async function POST(request: Request) {
             notes: e.notes ?? null,
           },
         });
-        await postLedgerEvent(
-          {
-            type: "EXPENSE_RECORDED",
-            expense: {
-              id: rec.id,
-              userId: user.id,
-              amount: e.amount, // use the pre-validated number; Decimal type would also work but number avoids any type friction
-              category: e.category,
-            },
-          },
-          tx
-        );
         out.push({ id: rec.id, description: rec.description, amount: e.amount });
+        events.push({
+          type: "EXPENSE_RECORDED",
+          expense: {
+            id: rec.id,
+            userId: user.id,
+            amount: e.amount,
+            category: e.category,
+          },
+        });
+      }
+      if (events.length > 0) {
+        await postLedgerEvents(events, tx);
       }
       return out;
     });

@@ -17,6 +17,7 @@ import { sendInvoiceEmail } from "@/lib/send-invoice-email";
 import type { RecurrenceFrequency, RecurringProfile, Invoice, Prisma } from "@prisma/client";
 import { getPrismaErrorCode } from "@/lib/api-helpers";
 import { withTenant } from "@/lib/tenant";
+import { withService } from "@/lib/service-context";
 import { postLedgerEvent } from "@/lib/ledger";
 
 export interface RecurringRunResult {
@@ -67,17 +68,22 @@ export async function processDueRecurringProfiles(
   const { userId, maxProfiles = 100 } = opts;
   const now = new Date();
 
-  const profiles = await prisma.recurringProfile.findMany({
-    where: {
-      active: true,
-      nextRunAt: { lte: now },
-      ...(userId ? { userId } : {}),
-      OR: [{ endDate: null }, { endDate: { gte: now } }],
-    },
-    include: { items: true, client: true, user: { include: { settings: true } } },
-    orderBy: { nextRunAt: "asc" },
-    take: maxProfiles,
-  });
+  // Run discovery under service_role (cross-tenant read) so cron workers
+  // don't need to connect as superuser. Per-profile writes still go
+  // through withTenant inside generateInvoiceFromProfile.
+  const profiles = await withService("cron:generate-recurring", (tx) =>
+    tx.recurringProfile.findMany({
+      where: {
+        active: true,
+        nextRunAt: { lte: now },
+        ...(userId ? { userId } : {}),
+        OR: [{ endDate: null }, { endDate: { gte: now } }],
+      },
+      include: { items: true, client: true, user: { include: { settings: true } } },
+      orderBy: { nextRunAt: "asc" },
+      take: maxProfiles,
+    })
+  );
 
   const results: RecurringRunResult[] = [];
 

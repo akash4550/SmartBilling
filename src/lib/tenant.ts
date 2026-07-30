@@ -71,9 +71,14 @@ async function assertRoleAndGuc(
     SELECT current_user AS current_role
   `;
   const currentRole = roleCheck[0]?.current_role;
-  if (currentRole !== "app_user") {
+  // Allow either app_user (default) or service_role (when called from a
+  // withService context, e.g. cron workers). Both roles are NOINHERIT/
+  // NOBYPASSRLS and enforce RLS. The service_role can read cross-tenant
+  // but the tenant-scoped write path below sets app.current_user_id so
+  // writes still enforce per-tenant WITH CHECK.
+  if (currentRole !== "app_user" && currentRole !== "service_role") {
     throw new TenantIsolationError(
-      `RLS assertion failed: current_role is "${currentRole}", expected "app_user". Aborting.`
+      `RLS assertion failed: current_role is "${currentRole}", expected "app_user" or "service_role". Aborting.`
     );
   }
   const gucCheck = await tx.$queryRaw<{ v: string | null }[]>`
@@ -89,10 +94,21 @@ async function assertRoleAndGuc(
 async function enterRls(
   tx: {
     $executeRawUnsafe: (q: string) => Promise<unknown>;
+    $queryRaw: <T = unknown>(q: TemplateStringsArray, ...p: unknown[]) => Promise<T>;
   },
   userId: string
 ) {
-  await tx.$executeRawUnsafe(`SET LOCAL ROLE app_user`);
+  // Determine which role we're running under; if we're currently the
+  // database owner (no prior SET ROLE), switch to app_user. If we're
+  // already in service_role (from a withService caller), leave the role
+  // as service_role but SET app.current_user_id so writes are scoped.
+  const roleCheck = await tx.$queryRaw<{ current_role: string }[]>`
+    SELECT current_user AS current_role
+  `;
+  const currentRole = roleCheck[0]?.current_role;
+  if (currentRole !== "service_role") {
+    await tx.$executeRawUnsafe(`SET LOCAL ROLE app_user`);
+  }
   await tx.$executeRawUnsafe(
     `SET LOCAL app.current_user_id = '${escapeStringLiteral(userId)}'`
   );

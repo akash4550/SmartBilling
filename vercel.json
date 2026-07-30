@@ -5,6 +5,10 @@
       "schedule": "* * * * *"
     },
     {
+      "path": "/api/cron/redrive-dlq?limit=10",
+      "schedule": "*/15 * * * *"
+    },
+    {
       "path": "/api/cron/generate-recurring",
       "schedule": "0 * * * *"
     },

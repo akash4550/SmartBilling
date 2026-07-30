@@ -380,3 +380,38 @@ psql "$DATABASE_URL" -f prisma/ledger.sql
 ```
 
 On an existing database, `backfillLedger()` is idempotent — it posts `INVOICE_ISSUED` for every non-DRAFT invoice that has no issuance entry, plus `INVOICE_PAID`/`INVOICE_VOIDED`/`EXPENSE_RECORDED` as current state indicates.
+
+### 4. Service Role (Batch 6: Least-Privilege Background Workers)
+
+`app_user` is strictly tenant-scoped. A second role, `service_role` (NOINHERIT, NOBYPASSRLS), is used by background workers (crons, DLQ redrive, admin ops):
+
+- `withService(serviceName, fn)` opens a transaction, `SET LOCAL ROLE service_role; SET LOCAL app.service_name = '<name>';` and asserts both took effect before running the callback (same fail-closed pattern as `withTenant()`).
+- Tenant tables use RLS policies with an OR-clause: rows are visible if either `app.current_user_id = userId` (tenant mode) **or** `app.service_name IS NOT NULL` (service discovery mode).
+- Writes via RLS **always** require `app.current_user_id` to match `userId` (WITH CHECK), even for service_role — a cron cannot write across tenants, only *discover* across them to know which tenant to process next. When a per-tenant write is needed, workers drop into `withTenant(userId, fn, {tx})` inside the service tx to SET `app.current_user_id`.
+- Application code no longer needs to connect as the database superuser for runtime queries. Migrations/seeding still run as the owner (`smartbill`).
+
+To apply:
+```bash
+psql "$DATABASE_URL" -f prisma/service-role.sql
+```
+
+### 5. Ledger Throughput (Batch 6)
+
+To avoid serial-chain lock contention during high-throughput bursts (bulk CSV imports, subscription renewals):
+
+- `postLedgerEvents(events[])` accepts multiple events for the **same** user, acquires the per-user advisory lock **once**, computes the entire chain of hashes for all entries across all events, and inserts via a single bulk `createMany`. This reduces lock hold time from N round trips to 1.
+- `postLedgerEvent` / `postLedgerEvents` now include bounded retry with exponential backoff (20ms · 2^n + jitter, up to 4 retries) on Postgres transient errors: `deadlock_detected (40P01)`, `lock_not_available (55P03)`, `serialization_failure (40001)`, and connection-reset errors.
+- The CSV expense import now uses `postLedgerEvents` for the bulk ledger append (one lock per import, not per row). The cron worker dispatches serially, so Stripe/Razorpay webhook bursts are absorbed by the SKIP LOCKED queue and don't contend on the ledger at ingest time.
+
+The hash chain itself is still strictly serialized per user — we have not weakened tamper-evidence, only shortened the critical section.
+
+### 6. DLQ Replay, Poison-Pill Isolation & Alerting (Batch 6)
+
+The webhook DLQ is now an operational subsystem, not a graveyard:
+
+- **Poison-pill classification.** `classifyError(err)` inspects the failure and flags deterministic errors (malformed JSON, invalid signature, unknown provider, `resource_missing`) as poison. These go directly to `POISON` status on the first failure and are **never auto-retried or auto-redriven** — no infinite cycling.
+- **Transient failures** move to `DLQ` after 5 attempts with `redriveAfter = now + 15m`. The `/api/cron/redrive-dlq` cron (every 15 min) flips eligible rows back to PENDING (capped at 10/tick) for reprocessing.
+- **Redrive quota.** Each row is auto-redriven at most `MAX_REDRIVES = 3` times; after that it is promoted to `POISON` with `poisonReason = "redrive_quota_exceeded"` so a persistent downstream outage doesn't cycle rows forever.
+- **Operator controls.** `POST /api/admin/dlq/:id?action=redrive[&force=1]` replays one row (force=1 bypasses the POISON check for an operator-confirmed replay); `POST /api/admin/dlq/:id?action=resolve` marks a row resolved with an operator note. `GET /api/admin/dlq` lists rows. All endpoints authenticate via `CRON_SECRET`.
+- **Alerting.** `registerDlqAlertHook(hook)` lets any module subscribe to DLQ/POISON transitions. The default hook emits a structured `[dlq-alert]` error log line (consumed by Vercel Log Drains / Datadog / whatever log shipper you use). Adding Slack/PagerDuty/Resend notifications is a one-line hook registration.
+- Idempotency: replaying an already-DONE/PENDING/PROCESSING row returns `{ ok: false, reason: 'already_*' }`. Rows that have been replayed and fail again naturally re-enter the retry/DLQ path up to the redrive cap.

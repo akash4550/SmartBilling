@@ -1,5 +1,5 @@
 /**
- * Async webhook ingestion.
+ * Async webhook ingestion (Batch 6 production hardening).
  *
  * Edge handlers (Stripe/Razorpay/Resend) do:
  *   1. Verify HMAC/signature (fail-closed in prod).
@@ -12,17 +12,41 @@
  * The `/api/cron/process-webhooks` worker claims rows via
  * `SELECT ... FOR UPDATE SKIP LOCKED`, dispatches to provider-specific
  * handlers, and manages retries with exponential backoff (5s * 2^n + jitter).
- * After 5 attempts, rows are routed to DLQ for manual review.
  *
- * Raw bodies are retained for 90 days for forensic audit.
+ * Failure handling (Batch 6):
+ *   - Deterministic errors (malformed JSON, unknown provider, invalid
+ *     signature) are classified as poison-pill → status POISON, never
+ *     auto-retried or redriven. They require operator intervention.
+ *   - Transient errors move to DLQ after MAX_ATTEMPTS, with redriveAfter
+ *     set to now + REDRIVE_BACKOFF (15m) so they don't spin forever.
+ *   - The `/api/cron/redrive-dlq` worker flips eligible DLQ rows back to
+ *     PENDING up to MAX_REDRIVES (3) per row. After MAX_REDRIVES they
+ *     are promoted to POISON (quarantine) with an operator alert.
+ *   - Stuck PROCESSING rows are reaped (crash recovery).
+ *
+ * Alerting: a pluggable `registerDlqAlertHook()` allows callers to push
+ * alerts (stderr → log aggregator, Resend, Slack) when rows hit DLQ or
+ * POISON.
+ *
+ * All helpers accept an optional `client` parameter (Prisma client or tx)
+ * so callers can bind them to a withService/withTenant transaction rather
+ * than touching the global superuser prisma. Defaults to the global prisma
+ * for back-compat.
  */
 import { Prisma } from "@prisma/client";
-import { prisma } from "@/lib/prisma";
+import { prisma as defaultPrisma } from "@/lib/prisma";
 
 export type WebhookProvider = "stripe" | "razorpay" | "resend";
 
 export const MAX_ATTEMPTS = 5;
-const BASE_BACKOFF_MS = 5_000; // doubles each attempt → 5,10,20,40,80s
+export const MAX_REDRIVES = 3;
+const BASE_BACKOFF_MS = 5_000;
+const REDRIVE_BACKOFF_MS = 15 * 60 * 1000;
+const DEFAULT_REDRIVE_BATCH = 10;
+
+type PrismaClient = typeof defaultPrisma;
+type PrismaTx = Prisma.TransactionClient;
+type AnyPrisma = PrismaClient | PrismaTx;
 
 export interface IngestInput {
   provider: WebhookProvider;
@@ -37,17 +61,67 @@ export interface IngestResult {
   duplicate: boolean;
 }
 
+export type AlertHook = (row: {
+  id: string;
+  provider: string;
+  eventType: string;
+  status: "DLQ" | "POISON";
+  attempts: number;
+  redriveCount: number;
+  lastError: string | null;
+  poisonReason: string | null;
+}) => void | Promise<void>;
+
+const alertHooks: AlertHook[] = [];
+
+export function registerDlqAlertHook(hook: AlertHook): void {
+  alertHooks.push(hook);
+}
+
+async function fireAlerts(row: {
+  id: string;
+  provider: string;
+  eventType: string;
+  status: "DLQ" | "POISON";
+  attempts: number;
+  redriveCount: number;
+  lastError: string | null;
+  poisonReason: string | null;
+}) {
+  for (const hook of alertHooks) {
+    try {
+      await hook(row);
+    } catch (err) {
+      console.error("[webhook-ingestion] alert hook failed:", err);
+    }
+  }
+}
+
 /**
- * Insert a webhook payload into the staging table. Returns the new row id
- * and `duplicate: true` if the (provider, providerEventId) was already
- * seen (provider retries are harmlessly absorbed).
- *
- * Runs as superuser (the webhook_ingestions table is not tenant-scoped).
+ * Classify an error as deterministic (poison pill) vs transient.
  */
-export async function ingestWebhook(input: IngestInput): Promise<IngestResult> {
+export function classifyError(
+  err: unknown
+): { poison: boolean; reason?: string } {
+  const msg = err instanceof Error ? err.message : String(err ?? "unknown");
+  if (/Unknown provider/i.test(msg)) return { poison: true, reason: "unknown_provider" };
+  if (/invalid.*json|malformed.*json|json.*parse|syntaxerror|unexpected token/i.test(msg))
+    return { poison: true, reason: "malformed_json" };
+  if (/signature.*(invalid|verification|mismatch)|no signature|hmac/i.test(msg))
+    return { poison: true, reason: "invalid_signature" };
+  if (/no such (invoice|customer|payment|charge|intent)|resource_missing/i.test(msg))
+    return { poison: true, reason: "missing_resource" };
+  return { poison: false };
+}
+
+/** Insert a webhook into the staging table. (Edge path — short INSERT.) */
+export async function ingestWebhook(
+  input: IngestInput,
+  client: AnyPrisma = defaultPrisma
+): Promise<IngestResult> {
   const { provider, providerEventId, eventType, rawBody, signature } = input;
   try {
-    const row = await prisma.webhookIngestion.create({
+    const row = await client.webhookIngestion.create({
       data: {
         provider,
         providerEventId: providerEventId ?? null,
@@ -61,7 +135,6 @@ export async function ingestWebhook(input: IngestInput): Promise<IngestResult> {
     });
     return { id: row.id, duplicate: false };
   } catch (err) {
-    // P2002 unique violation → duplicate provider event id → ack 202.
     const code =
       typeof err === "object" && err !== null && "code" in err
         ? (err as { code: string }).code
@@ -73,14 +146,9 @@ export async function ingestWebhook(input: IngestInput): Promise<IngestResult> {
   }
 }
 
-/**
- * Backoff calculator: BASE_BACKOFF_MS * 2^attempts + jitter(0..1000ms).
- * `attempts` is the *just-failed* attempt count (0 after first fail).
- */
 export function nextBackoff(attempts: number, now = Date.now()): Date {
   const jitter = Math.floor(Math.random() * 1000);
-  const delay = BASE_BACKOFF_MS * Math.pow(2, attempts) + jitter;
-  return new Date(now + delay);
+  return new Date(now + BASE_BACKOFF_MS * Math.pow(2, attempts) + jitter);
 }
 
 export interface ClaimOptions {
@@ -89,12 +157,10 @@ export interface ClaimOptions {
 }
 
 /**
- * Claim up to `limit` due rows via SELECT ... FOR UPDATE SKIP LOCKED
- * so concurrent workers don't fight over the same row. Marks them
- * PROCESSING and returns them for dispatch.
+ * Claim up to `limit` due rows via SELECT FOR UPDATE SKIP LOCKED.
  */
 export async function claimDue(
-  opts: ClaimOptions = {}
+  opts: ClaimOptions & { client?: AnyPrisma } = {}
 ): Promise<
   Array<{
     id: string;
@@ -105,7 +171,7 @@ export async function claimDue(
     attempts: number;
   }>
 > {
-  const { limit = 10, provider } = opts;
+  const { limit = 10, provider, client = defaultPrisma } = opts;
   const now = new Date();
   const workerId = getWorkerId();
 
@@ -113,7 +179,7 @@ export async function claimDue(
     ? Prisma.sql`AND provider = ${provider}`
     : Prisma.empty;
 
-  const rows = await prisma.$queryRaw<
+  const rows = await client.$queryRaw<
     Array<{
       id: string;
       provider: string;
@@ -136,13 +202,9 @@ export async function claimDue(
   if (rows.length === 0) return [];
 
   const ids = rows.map((r) => r.id);
-  await prisma.webhookIngestion.updateMany({
+  await client.webhookIngestion.updateMany({
     where: { id: { in: ids } },
-    data: {
-      status: "PROCESSING",
-      lockedBy: workerId,
-      lockedAt: new Date(),
-    },
+    data: { status: "PROCESSING", lockedBy: workerId, lockedAt: new Date() },
   });
 
   return rows.map((r) => ({
@@ -163,8 +225,8 @@ function getWorkerId(): string {
   return _workerId;
 }
 
-export async function markDone(id: string) {
-  await prisma.webhookIngestion.update({
+export async function markDone(id: string, client: AnyPrisma = defaultPrisma) {
+  await client.webhookIngestion.update({
     where: { id },
     data: {
       status: "DONE",
@@ -177,17 +239,56 @@ export async function markDone(id: string) {
 }
 
 /**
- * Record a failed attempt. If attempts+1 >= MAX_ATTEMPTS → DLQ.
- * Otherwise schedule next retry with exponential backoff.
+ * Record a failed attempt. Classifies error as poison vs transient.
  */
-export async function markRetry(id: string, attempts: number, error: unknown) {
+export async function markRetry(
+  id: string,
+  attempts: number,
+  error: unknown,
+  client: AnyPrisma = defaultPrisma
+) {
   const nextAttempts = attempts + 1;
-  const truncatedError =
-    error instanceof Error ? error.message : String(error ?? "unknown");
-  const safeError = truncatedError.slice(0, 2048);
+  const safeError =
+    (error instanceof Error ? error.message : String(error ?? "unknown")).slice(0, 2048);
+  const classification = classifyError(error);
+
+  if (classification.poison) {
+    await client.webhookIngestion.update({
+      where: { id },
+      data: {
+        status: "POISON",
+        attempts: nextAttempts,
+        lastError: safeError,
+        poisonPill: true,
+        poisonReason: classification.reason ?? "deterministic_failure",
+        lockedBy: null,
+        lockedAt: null,
+        processedAt: new Date(),
+        lastAlertedAt: new Date(),
+      },
+    });
+    console.error(
+      `[webhook-worker] ${id} flagged POISON (${classification.reason}) after ${nextAttempts} attempts: ${safeError}`
+    );
+    const fresh = await client.webhookIngestion.findUnique({
+      where: { id },
+      select: { provider: true, eventType: true },
+    });
+    await fireAlerts({
+      id,
+      provider: fresh?.provider ?? "unknown",
+      eventType: fresh?.eventType ?? "unknown",
+      status: "POISON",
+      attempts: nextAttempts,
+      redriveCount: 0,
+      lastError: safeError,
+      poisonReason: classification.reason ?? null,
+    });
+    return;
+  }
 
   if (nextAttempts >= MAX_ATTEMPTS) {
-    await prisma.webhookIngestion.update({
+    const updated = await client.webhookIngestion.update({
       where: { id },
       data: {
         status: "DLQ",
@@ -196,14 +297,26 @@ export async function markRetry(id: string, attempts: number, error: unknown) {
         lockedBy: null,
         lockedAt: null,
         processedAt: new Date(),
+        redriveAfter: new Date(Date.now() + REDRIVE_BACKOFF_MS),
+        lastAlertedAt: new Date(),
       },
     });
     console.error(
       `[webhook-worker] ${id} moved to DLQ after ${nextAttempts} attempts: ${safeError}`
     );
+    await fireAlerts({
+      id,
+      provider: updated.provider,
+      eventType: updated.eventType,
+      status: "DLQ",
+      attempts: nextAttempts,
+      redriveCount: updated.redriveCount,
+      lastError: safeError,
+      poisonReason: null,
+    });
     return;
   }
-  await prisma.webhookIngestion.update({
+  await client.webhookIngestion.update({
     where: { id },
     data: {
       status: "PENDING",
@@ -216,17 +329,110 @@ export async function markRetry(id: string, attempts: number, error: unknown) {
   });
 }
 
-/** Re-claim stuck PROCESSING rows (lockedAt older than `staleMs`) back to PENDING. */
-export async function reapStaleClaims(staleMs = 5 * 60 * 1000): Promise<number> {
+export async function reapStaleClaims(
+  staleMs = 5 * 60 * 1000,
+  client: AnyPrisma = defaultPrisma
+): Promise<number> {
   const cutoff = new Date(Date.now() - staleMs);
-  const result = await prisma.webhookIngestion.updateMany({
+  const r = await client.webhookIngestion.updateMany({
     where: { status: "PROCESSING", lockedAt: { lt: cutoff } },
+    data: { status: "PENDING", lockedBy: null, lockedAt: null, nextAttemptAt: new Date() },
+  });
+  return r.count;
+}
+
+export async function redriveOne(
+  id: string,
+  opts: { operator?: boolean; client?: AnyPrisma; note?: string } = {}
+): Promise<{ ok: boolean; reason?: string }> {
+  const { operator = false, client = defaultPrisma } = opts;
+  const row = await client.webhookIngestion.findUnique({ where: { id } });
+  if (!row) return { ok: false, reason: "not_found" };
+  if (row.status === "DONE") return { ok: false, reason: "already_done" };
+  if (row.status === "POISON" && !operator) return { ok: false, reason: "poison_pill" };
+  if (row.status === "PENDING" || row.status === "PROCESSING") return { ok: false, reason: "already_queued" };
+  if (row.redriveCount >= MAX_REDRIVES && !operator) {
+    await client.webhookIngestion.update({
+      where: { id },
+      data: {
+        status: "POISON",
+        poisonPill: true,
+        poisonReason: "redrive_quota_exceeded",
+        lastAlertedAt: new Date(),
+      },
+    });
+    console.error(
+      `[webhook-redrive] ${id} promoted to POISON after ${row.redriveCount} redrives (quota exceeded)`
+    );
+    await fireAlerts({
+      id, provider: row.provider, eventType: row.eventType, status: "POISON",
+      attempts: row.attempts, redriveCount: row.redriveCount,
+      lastError: row.lastError, poisonReason: "redrive_quota_exceeded",
+    });
+    return { ok: false, reason: "quota_exceeded_poisoned" };
+  }
+  const nextRedrive = row.redriveCount + 1;
+  await client.webhookIngestion.update({
+    where: { id },
     data: {
       status: "PENDING",
-      lockedBy: null,
-      lockedAt: null,
+      redriveCount: nextRedrive,
       nextAttemptAt: new Date(),
+      lockedBy: null, lockedAt: null, processedAt: null,
     },
   });
-  return result.count;
+  console.log(`[webhook-redrive] ${id} redriven (redrive #${nextRedrive})${operator ? " by operator" : ""}`);
+  return { ok: true };
+}
+
+export async function redriveEligible(
+  limit: number = DEFAULT_REDRIVE_BATCH,
+  client: AnyPrisma = defaultPrisma
+): Promise<{ redriven: number; poisoned: number; skipped: number }> {
+  const now = new Date();
+  const eligible = await client.webhookIngestion.findMany({
+    where: { status: "DLQ", poisonPill: false, redriveAfter: { lte: now }, resolvedAt: null },
+    orderBy: { redriveAfter: "asc" },
+    take: Math.min(limit, 50),
+    select: { id: true },
+  });
+  let redriven = 0, poisoned = 0;
+  for (const r of eligible) {
+    const res = await redriveOne(r.id, { client });
+    if (res.ok) redriven++;
+    else if (res.reason === "quota_exceeded_poisoned") poisoned++;
+  }
+  return { redriven, poisoned, skipped: eligible.length - redriven - poisoned };
+}
+
+export async function resolveDlq(
+  id: string, note: string, client: AnyPrisma = defaultPrisma
+): Promise<{ ok: boolean; reason?: string }> {
+  const row = await client.webhookIngestion.findUnique({ where: { id } });
+  if (!row) return { ok: false, reason: "not_found" };
+  if (row.status === "DONE") return { ok: false, reason: "already_done" };
+  await client.webhookIngestion.update({
+    where: { id },
+    data: { resolvedAt: new Date(), resolveNote: note.slice(0, 2048) },
+  });
+  return { ok: true };
+}
+
+export async function listDlq(
+  opts: { status?: "DLQ" | "POISON"; limit?: number; includeResolved?: boolean; client?: AnyPrisma } = {}
+) {
+  const { status, limit = 50, includeResolved = false, client = defaultPrisma } = opts;
+  const where: Record<string, unknown> = {};
+  if (status) where.status = status;
+  else where.status = { in: ["DLQ", "POISON"] };
+  if (!includeResolved) where.resolvedAt = null;
+  return client.webhookIngestion.findMany({
+    where, orderBy: { createdAt: "desc" }, take: Math.min(limit, 200),
+    select: {
+      id: true, provider: true, providerEventId: true, eventType: true,
+      attempts: true, lastError: true, poisonPill: true, poisonReason: true,
+      redriveCount: true, redriveAfter: true, createdAt: true, lockedBy: true,
+      resolvedAt: true, resolveNote: true,
+    },
+  });
 }

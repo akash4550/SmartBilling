@@ -381,8 +381,15 @@ enum WebhookIngestionStatus {
   PROCESSING
   // Successfully processed.
   DONE
-  // Permanently failed after max attempts; routed to DLQ for manual review.
+  // Transiently failed and moved to DLQ for later redrive. Rows may be
+  // re-driven (back to PENDING) by /api/cron/redrive-dlq or by an
+  // operator endpoint up to MAX_REDRIVES times.
   DLQ
+  // Permanently quarantined — a deterministic fatal error (malformed
+  // payload, unknown provider, invalid signature). These are never
+  // auto-redriven; they require operator inspection and are flagged
+  // as poison-pill for alerting.
+  POISON
 }
 
 model WebhookIngestion {
@@ -408,7 +415,8 @@ model WebhookIngestion {
   //   5s * 2^attempts + jitter(0..1000ms)
   // PENDING/RETRY rows with nextAttemptAt <= now are eligible for claim.
   nextAttemptAt   DateTime                @default(now())
-  // Status lifecycle: PENDING → PROCESSING → DONE (or → DLQ after 5 fails).
+  // Status lifecycle: PENDING → PROCESSING → DONE
+  //                           ↳ retries → PENDING/RETRY → DLQ → (redrive → PENDING) → POISON.
   status          WebhookIngestionStatus  @default(PENDING)
   // Worker identifier (process pid + hostname) while PROCESSING, for
   // operator visibility / stuck-claim reaping.
@@ -417,9 +425,33 @@ model WebhookIngestion {
   processedAt     DateTime?
   createdAt       DateTime                @default(now())
 
+  // --- Batch 6 DLQ enhancements ---
+  // True if the failure was deterministic (malformed payload, unknown
+  // provider, bad signature) — auto-redrive is unsafe; quarantine as
+  // POISON after initial classification.
+  poisonPill      Boolean                 @default(false)
+  // Why this was flagged as a poison pill (deterministic-failure reason).
+  poisonReason    String?                 @db.Text
+  // Number of times the row has been sent back from DLQ → PENDING via
+  // redrive. After MAX_REDRIVES (3), it is promoted to POISON to prevent
+  // infinite cycling.
+  redriveCount    Int                     @default(0)
+  // Earliest time a DLQ row is eligible for automatic redrive. Gives
+  // operators a cooldown window after a downstream outage before replays
+  // start. null means "not yet scheduled for redrive" (operator review).
+  redriveAfter    DateTime?
+  // Last time an alert was emitted for this row (rate-limits alert spam).
+  lastAlertedAt   DateTime?
+  // When the row was resolved / acknowledged by an operator.
+  resolvedAt      DateTime?
+  // Free-text operator note on resolution.
+  resolveNote     String?                 @db.Text
+
   @@unique([provider, providerEventId], name: "wh_ingest_provider_event_uniq")
   @@index([status, nextAttemptAt], name: "wh_ingest_claim_idx")
   @@index([createdAt], name: "wh_ingest_created_idx")
+  @@index([status, redriveAfter], name: "wh_ingest_redrive_idx")
+  @@index([poisonPill, status], name: "wh_ingest_poison_idx")
   @@map("webhook_ingestions")
 }
 

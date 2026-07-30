@@ -20,12 +20,25 @@ import {
   markRetry,
   reapStaleClaims,
   MAX_ATTEMPTS,
+  registerDlqAlertHook,
 } from "@/lib/webhook-ingestion";
 import {
   processStripeEvent,
   processRazorpayEvent,
   processResendEvent,
 } from "@/lib/webhook-processors";
+import { withService } from "@/lib/service-context";
+
+let hookRegistered = false;
+function ensureHooks() {
+  if (hookRegistered) return;
+  hookRegistered = true;
+  registerDlqAlertHook(async (row) => {
+    console.error(
+      `[dlq-alert] status=${row.status} provider=${row.provider} event=${row.eventType} attempts=${row.attempts} redrives=${row.redriveCount} error=${row.lastError ?? "n/a"} reason=${row.poisonReason ?? "n/a"} id=${row.id}`
+    );
+  });
+}
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -63,52 +76,50 @@ async function handleRequest(request: Request) {
     );
   }
 
+  ensureHooks();
+
   try {
-    const reaped = await reapStaleClaims();
+    // Run the worker under service_role (least-privilege, no superuser).
+    // All webhook_ingestions writes are performed on `tx` so RLS (which
+    // requires app.service_name to be set) applies.
+    const result = await withService("cron:process-webhooks", async (tx) => {
+      const reaped = await reapStaleClaims(undefined, tx);
 
-    const rows = await claimDue({ limit: BATCH_SIZE });
+      const rows = await claimDue({ limit: BATCH_SIZE, client: tx });
 
-    let succeeded = 0;
-    let failed = 0;
-    let dlq = 0;
+      let succeeded = 0;
+      let failed = 0;
+      let dlq = 0;
 
-    for (const row of rows) {
-      try {
-        switch (row.provider) {
-          case "stripe":
-            await processStripeEvent(row.rawBody);
-            break;
-          case "razorpay":
-            await processRazorpayEvent(row.rawBody);
-            break;
-          case "resend":
-            await processResendEvent(row.rawBody);
-            break;
-          default:
-            // Unknown provider — move to DLQ immediately rather than
-            // looping retries forever.
-            throw new Error(`Unknown provider: ${row.provider}`);
+      for (const row of rows) {
+        try {
+          switch (row.provider) {
+            case "stripe":
+              await processStripeEvent(row.rawBody);
+              break;
+            case "razorpay":
+              await processRazorpayEvent(row.rawBody);
+              break;
+            case "resend":
+              await processResendEvent(row.rawBody);
+              break;
+            default:
+              throw new Error(`Unknown provider: ${row.provider}`);
+          }
+          await markDone(row.id, tx);
+          succeeded++;
+        } catch (err) {
+          const beforeAttempts = row.attempts;
+          await markRetry(row.id, beforeAttempts, err, tx);
+          failed++;
+          if (beforeAttempts + 1 >= MAX_ATTEMPTS) dlq++;
         }
-        await markDone(row.id);
-        succeeded++;
-      } catch (err) {
-        // markRetry increments attempts; if it hits MAX_ATTEMPTS it moves
-        // to DLQ internally.
-        const beforeAttempts = row.attempts;
-        await markRetry(row.id, beforeAttempts, err);
-        failed++;
-        if (beforeAttempts + 1 >= MAX_ATTEMPTS) dlq++;
       }
-    }
 
-    return NextResponse.json({
-      ok: true,
-      reaped,
-      claimed: rows.length,
-      succeeded,
-      failed,
-      dlq,
+      return { reaped, claimed: rows.length, succeeded, failed, dlq };
     });
+
+    return NextResponse.json({ ok: true, ...result });
   } catch (err) {
     console.error("[cron/process-webhooks] Worker error:", err);
     return NextResponse.json(
