@@ -36,6 +36,24 @@ export class TenantIsolationError extends Error {
 }
 
 /**
+ * Thrown when a mutating call is attempted against a quarantined tenant.
+ * Reads (allowQuarantinedRead=true) are permitted so operators can diagnose;
+ * writes are refused both here and at the Postgres trigger layer.
+ */
+export class LedgerQuarantinedError extends Error {
+  public readonly userId: string;
+  public readonly reason: string | null;
+  constructor(userId: string, reason: string | null) {
+    super(
+      `Ledger quarantined for tenant ${userId} (reason=${reason ?? "unspecified"}). Writes blocked.`
+    );
+    this.name = "LedgerQuarantinedError";
+    this.userId = userId;
+    this.reason = reason;
+  }
+}
+
+/**
  * Allow-list of characters for the userId before interpolation into SET LOCAL.
  * CUIDs/UUIDs/ULIDs and similar are covered; single quotes and backslashes
  * are rejected so SQL injection is impossible even if the caller is buggy.
@@ -114,6 +132,18 @@ async function enterRls(
   );
 }
 
+export interface WithTenantOptions {
+  isolationLevel?: Prisma.TransactionIsolationLevel;
+  tx?: Prisma.TransactionClient;
+  /**
+   * If true, run the callback even when the tenant is quarantined.
+   * Default false (writes are refused for quarantined tenants both here
+   * and at the Postgres trigger layer; set this only for read-only
+   * diagnostic paths that must be able to see quarantined state).
+   */
+  allowQuarantinedRead?: boolean;
+}
+
 /**
  * Execute `fn` inside an RLS-protected context scoped to `userId`.
  *
@@ -129,9 +159,7 @@ async function enterRls(
 export async function withTenant<T>(
   userId: string,
   fn: (tx: Prisma.TransactionClient) => Promise<T>,
-  txOrOpts?:
-    | Prisma.TransactionClient
-    | { isolationLevel?: Prisma.TransactionIsolationLevel; tx?: Prisma.TransactionClient }
+  txOrOpts?: Prisma.TransactionClient | WithTenantOptions
 ): Promise<T> {
   if (!userId || typeof userId !== "string") {
     throw new TenantIsolationError("withTenant: userId is required");
@@ -141,16 +169,29 @@ export async function withTenant<T>(
   // Normalize the third arg.
   let existingTx: Prisma.TransactionClient | undefined;
   let isolationLevel: Prisma.TransactionIsolationLevel = "ReadCommitted";
+  let allowQuarantinedRead = false;
   if (txOrOpts) {
     if (typeof txOrOpts === "object" && "$executeRawUnsafe" in txOrOpts) {
       existingTx = txOrOpts as Prisma.TransactionClient;
     } else if (typeof txOrOpts === "object") {
-      const opts = txOrOpts as {
-        isolationLevel?: Prisma.TransactionIsolationLevel;
-        tx?: Prisma.TransactionClient;
-      };
+      const opts = txOrOpts as WithTenantOptions;
       if (opts.isolationLevel) isolationLevel = opts.isolationLevel;
       if (opts.tx) existingTx = opts.tx;
+      if (opts.allowQuarantinedRead) allowQuarantinedRead = true;
+    }
+  }
+
+  // Quarantine check: runs as superuser against the database-owner
+  // connection so it is not blocked by the tenant being under RLS. We
+  // only skip this check when the caller explicitly opted into
+  // read-only diagnostic access.
+  if (!allowQuarantinedRead) {
+    const row = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { ledgerQuarantinedAt: true, ledgerQuarantineReason: true },
+    });
+    if (row?.ledgerQuarantinedAt) {
+      throw new LedgerQuarantinedError(userId, row.ledgerQuarantineReason ?? null);
     }
   }
 

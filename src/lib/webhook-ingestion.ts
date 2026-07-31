@@ -225,6 +225,28 @@ function getWorkerId(): string {
   return _workerId;
 }
 
+/**
+ * Place a row back into PENDING with lastError='tenant_quarantined' and
+ * a 15-minute backoff. Used by the webhook worker when the owning tenant
+ * is under ledger quarantine — we do NOT mark it failed/DLQ; we hold it
+ * so customer payments are not lost. Attempts counter is NOT incremented.
+ */
+export async function markQuarantineHold(
+  id: string,
+  client: AnyPrisma = defaultPrisma
+) {
+  await client.webhookIngestion.update({
+    where: { id },
+    data: {
+      status: "PENDING",
+      lastError: "tenant_quarantined",
+      nextAttemptAt: new Date(Date.now() + 15 * 60 * 1000),
+      lockedBy: null,
+      lockedAt: null,
+    },
+  });
+}
+
 export async function markDone(id: string, client: AnyPrisma = defaultPrisma) {
   await client.webhookIngestion.update({
     where: { id },
@@ -381,7 +403,6 @@ export async function redriveOne(
       lockedBy: null, lockedAt: null, processedAt: null,
     },
   });
-  console.log(`[webhook-redrive] ${id} redriven (redrive #${nextRedrive})${operator ? " by operator" : ""}`);
   return { ok: true };
 }
 

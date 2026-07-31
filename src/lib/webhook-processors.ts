@@ -14,6 +14,23 @@ import { markInvoicePaid, logPaymentFailed } from "@/lib/invoice-helpers";
 import { logActivity } from "@/lib/activity";
 import type Stripe from "stripe";
 
+/**
+ * Returns true if the tenant (invoice owner) is under ledger quarantine.
+ * When true, webhook processing should be SKIPPED for this event — the
+ * caller leaves the webhook_ingestion row PENDING with lastError set to
+ * 'tenant_quarantined' so no customer payment is lost; processing resumes
+ * after operator release.
+ */
+export async function isTenantQuarantined(userId: string): Promise<boolean> {
+  const u = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { ledgerQuarantinedAt: true },
+  });
+  return !!u?.ledgerQuarantinedAt;
+}
+
+export const TENANT_QUARANTINED_ERR = "tenant_quarantined";
+
 // ---------------------------- STRIPE ----------------------------
 
 /**

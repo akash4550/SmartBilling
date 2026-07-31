@@ -14,10 +14,12 @@
  */
 import { NextResponse } from "next/server";
 import { timingSafeEqual } from "@/lib/api-helpers";
+import { prisma } from "@/lib/prisma";
 import {
   claimDue,
   markDone,
   markRetry,
+  markQuarantineHold,
   reapStaleClaims,
   MAX_ATTEMPTS,
   registerDlqAlertHook,
@@ -26,6 +28,8 @@ import {
   processStripeEvent,
   processRazorpayEvent,
   processResendEvent,
+  isTenantQuarantined,
+  TENANT_QUARANTINED_ERR,
 } from "@/lib/webhook-processors";
 import { withService } from "@/lib/service-context";
 
@@ -50,6 +54,88 @@ export async function GET(request: Request) {
 }
 export async function POST(request: Request) {
   return handleRequest(request);
+}
+
+/**
+ * Best-effort extract the tenant userId from a webhook row so we can
+ * check quarantine BEFORE touching business tables. We parse the
+ * rawBody only enough to read provider metadata; on any failure we
+ * return null (quarantine check is skipped; the processor will do a
+ * real parse and fail normally).
+ */
+async function tenantForWebhook(row: {
+  id: string;
+  provider: string;
+  rawBody: string;
+}): Promise<string | null> {
+  try {
+    const parsed = JSON.parse(row.rawBody) as Record<string, unknown>;
+
+    // Stripe: data.object.metadata.invoiceId or data.object.id (cs_...) → lookup
+    const data = (parsed.data ?? {}) as Record<string, unknown>;
+    const object = (data.object ?? {}) as Record<string, unknown>;
+    const stripeMeta = (object.metadata ?? parsed.metadata ?? {}) as Record<string, string>;
+    if (typeof stripeMeta.invoiceId === "string" && stripeMeta.invoiceId.length > 0) {
+      const inv = await prisma.invoice.findUnique({
+        where: { id: stripeMeta.invoiceId },
+        select: { userId: true },
+      });
+      if (inv) return inv.userId;
+    }
+    if (typeof object.id === "string" && /^cs_/.test(object.id)) {
+      const inv2 = await prisma.invoice.findFirst({
+        where: { stripeCheckoutSessionId: object.id },
+        select: { userId: true },
+      });
+      if (inv2) return inv2.userId;
+    }
+
+    // Razorpay: payload.payment.entity.notes.invoiceId or payload.order.entity.id
+    const payload = (parsed.payload ?? {}) as Record<string, unknown>;
+    const payment = (payload.payment ?? {}) as Record<string, unknown>;
+    const pEntity = (payment.entity ?? {}) as Record<string, unknown>;
+    const order = (payload.order ?? {}) as Record<string, unknown>;
+    const oEntity = (order.entity ?? {}) as Record<string, unknown>;
+    const rzNotes = (pEntity.notes ?? oEntity.notes ?? {}) as Record<string, string>;
+    if (typeof rzNotes.invoiceId === "string" && rzNotes.invoiceId.length > 0) {
+      const inv = await prisma.invoice.findUnique({
+        where: { id: rzNotes.invoiceId },
+        select: { userId: true },
+      });
+      if (inv) return inv.userId;
+    }
+    const rzOrderId = oEntity.id;
+    if (typeof rzOrderId === "string" && rzOrderId.length > 0) {
+      const inv = await prisma.invoice.findFirst({
+        where: { razorpayOrderId: rzOrderId },
+        select: { userId: true },
+      });
+      if (inv) return inv.userId;
+    }
+
+    // Resend: data.tags[].name === userId/invoiceId
+    const d = (parsed.data ?? {}) as Record<string, unknown>;
+    const tags = d.tags;
+    if (Array.isArray(tags)) {
+      for (const t of tags as Array<{ name?: unknown; value?: unknown }>) {
+        if (t && t.name === "userId" && typeof t.value === "string" && t.value.length > 0) {
+          return t.value;
+        }
+      }
+      for (const t of tags as Array<{ name?: unknown; value?: unknown }>) {
+        if (t && t.name === "invoiceId" && typeof t.value === "string" && t.value.length > 0) {
+          const inv = await prisma.invoice.findUnique({
+            where: { id: t.value },
+            select: { userId: true },
+          });
+          if (inv) return inv.userId;
+        }
+      }
+    }
+  } catch {
+    return null;
+  }
+  return null;
 }
 
 async function handleRequest(request: Request) {
@@ -90,9 +176,22 @@ async function handleRequest(request: Request) {
       let succeeded = 0;
       let failed = 0;
       let dlq = 0;
+      let quarantined = 0;
 
       for (const row of rows) {
         try {
+          // Quarantine short-circuit: if the tenant this event belongs to
+          // is under ledger quarantine, hold the event PENDING with
+          // lastError='tenant_quarantined' without incrementing attempts
+          // or DLQ counts. Payments are NOT dropped; processing resumes
+          // after operator release.
+          const uid = await tenantForWebhook(row);
+          if (uid && (await isTenantQuarantined(uid))) {
+            await markQuarantineHold(row.id, tx);
+            quarantined++;
+            continue;
+          }
+
           switch (row.provider) {
             case "stripe":
               await processStripeEvent(row.rawBody);
@@ -109,6 +208,14 @@ async function handleRequest(request: Request) {
           await markDone(row.id, tx);
           succeeded++;
         } catch (err) {
+          // If processor threw because the tenant is quarantined (race
+          // between lookup and dispatch), hold instead of failing.
+          const msg = err instanceof Error ? err.message : String(err);
+          if (msg === TENANT_QUARANTINED_ERR || /Ledger is quarantined|SQLSTATE.*L0001/i.test(msg)) {
+            await markQuarantineHold(row.id, tx);
+            quarantined++;
+            continue;
+          }
           const beforeAttempts = row.attempts;
           await markRetry(row.id, beforeAttempts, err, tx);
           failed++;
@@ -116,7 +223,7 @@ async function handleRequest(request: Request) {
         }
       }
 
-      return { reaped, claimed: rows.length, succeeded, failed, dlq };
+      return { reaped, claimed: rows.length, succeeded, failed, dlq, quarantined };
     });
 
     return NextResponse.json({ ok: true, ...result });

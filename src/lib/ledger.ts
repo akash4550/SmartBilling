@@ -108,11 +108,11 @@ interface EntryDraft {
 // HASHING
 // ============================================================
 
-function sha256Hex(input: string): string {
+export function sha256Hex(input: string): string {
   return crypto.createHash("sha256").update(input, "utf8").digest("hex");
 }
 
-function serializeForHash(input: {
+export function serializeForHash(input: {
   eventId: string;
   eventType: string;
   account: string;
@@ -132,6 +132,36 @@ function serializeForHash(input: {
     input.expenseId ?? "",
     input.currency,
   ].join("|");
+}
+
+/**
+ * Thrown when a financial write is attempted against a quarantined tenant.
+ * The reconciler flips users.ledgerQuarantinedAt on CRITICAL/HIGH drift;
+ * withTenant() / postLedgerEvent(s) refuse further writes as a first line
+ * of defense (the Postgres ledger_quarantine_guard() trigger is third).
+ */
+export class LedgerQuarantinedError extends Error {
+  public readonly userId: string;
+  public readonly reason: string | null;
+  constructor(userId: string, reason: string | null) {
+    super(
+      `Ledger quarantined for tenant ${userId} (reason=${reason ?? "unspecified"})`
+    );
+    this.name = "LedgerQuarantinedError";
+    this.userId = userId;
+    this.reason = reason;
+  }
+}
+
+/** Check quarantine flag outside of a tenant tx (as superuser). */
+async function assertNotQuarantined(userId: string, client: Pick<typeof prisma, "user"> = prisma) {
+  const u = await client.user.findUnique({
+    where: { id: userId },
+    select: { ledgerQuarantinedAt: true, ledgerQuarantineReason: true },
+  });
+  if (u?.ledgerQuarantinedAt) {
+    throw new LedgerQuarantinedError(userId, u.ledgerQuarantineReason ?? null);
+  }
 }
 
 // ============================================================
@@ -563,6 +593,10 @@ export async function postLedgerEvent(
   const prepared = prepareEvent(event);
   const userId = prepared.userId;
 
+  // Short-circuit before acquiring the advisory lock if the tenant is
+  // quarantined. This avoids taking a lock we'll immediately reject.
+  await assertNotQuarantined(userId);
+
   const doPost = async (txClient: Prisma.TransactionClient): Promise<PostResult> => {
     const batch = await appendPreparedEvents(txClient, userId, [prepared]);
     return batch.results[0];
@@ -604,6 +638,8 @@ export async function postLedgerEvents(
       throw new Error("postLedgerEvents: all events must be for the same userId");
     }
   }
+
+  await assertNotQuarantined(userId);
 
   const doPost = (txClient: Prisma.TransactionClient) =>
     appendPreparedEvents(txClient, userId, prepared);

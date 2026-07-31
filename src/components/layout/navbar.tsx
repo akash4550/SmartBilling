@@ -16,6 +16,7 @@ import {
   UserCog,
   RefreshCw,
   TrendingDown,
+  ShieldCheck,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ThemeToggle } from "@/components/theme-toggle";
@@ -93,6 +94,14 @@ function UserMenu({ email, name }: { email: string; name?: string | null }) {
             >
               <UserCog className="h-4 w-4 text-slate-500" />
               Account
+            </Link>
+            <Link
+              href="/admin/ledger"
+              onClick={() => setOpen(false)}
+              className="flex items-center gap-2.5 px-4 py-2.5 text-sm text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors"
+            >
+              <ShieldCheck className="h-4 w-4 text-slate-500" />
+              Ledger Audit Console
             </Link>
             <button
               onClick={handleSignOut}
