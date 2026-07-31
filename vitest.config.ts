@@ -12,6 +12,11 @@ export default defineConfig({
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
+      // Tests run in a pure Node server context — Next.js's `server-only`
+      // package throws on import as a client-boundary guard, which is
+      // meaningless (and actively breaks) under vitest. Alias it to a
+      // no-op shim.
+      "server-only": path.resolve(__dirname, "./test/_server-only-shim.ts"),
     },
   },
   test: {
