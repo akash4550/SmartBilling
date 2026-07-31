@@ -441,48 +441,58 @@ async function sweepB(
     );
   }
 
-  // Revenue/tax check: recompute per issued-then-non-void invoice is O(N)
-  // and known to drift when invoices are edited after issuance; we flag
-  // it as a MEDIUM informational check by comparing revenue+discount to
-  // (paid+open) cash-in + AR.
-  const revenueSigned = ledgerBalance.REVENUE ?? BigInt(0);   // normally negative (Cr)
-  const discountSigned = ledgerBalance.DISCOUNT_CONTRA ?? BigInt(0); // Dr
-  const taxSigned = ledgerBalance.TAX_PAYABLE ?? BigInt(0);  // Cr
-  // Net revenue recognized = -revenueSigned - discountSigned (Cr revenue
-  // less Dr contra). Tax liability = -taxSigned. Sum should equal total
-  // issued (across PENDING+PAID+VOID-reversed already reflected).
-  // We compare against (AR + CASH + EXPENSES) as a soft parity:
-  //   AR + CASH = (revenueCr - discountDr + taxCr)    (since expenses don't flow through AR/CASH)
-  // We check: (-revenueSigned - discountSigned + -taxSigned) ?== arLedger + paidCash - cashLedger...
-  // Simpler parity check: net credits to revenue+tax+discount contra should
-  // equal net issued (paise posted to AR across all events).
-  const netRevenueCr = -revenueSigned - discountSigned; // gross revenue - discount
-  const taxCr = -taxSigned;
-  const expectedIssued = openReceivable + paidCash; // AR_dr cumulative = total issued gross (including tax) - payments
-  // Actually the simplest robust check: sum of all credits to REVENUE + TAX_PAYABLE
-  // + DISCOUNT_CONTRA (signed) should equal Σ Dr to ACCOUNTS_RECEIVABLE (total issued
-  // gross). AR_dr - AR_cr = open AR balance. Total Dr to AR = openReceivable + totalCr to AR
-  // = openReceivable + cashReceived (cash Cr to AR from INVOICE_PAID). But cash received
-  // = paidCash (simple assumption when no payment reversals). This is fragile when
-  // reversals/voids happen, so only flag as MEDIUM when the parity is off by more
-  // than zero and we have no CRITICAL/HIGH findings already.
-  // Compute Σ debits to AR from ledger:
-  const arDrRow = await tx.$queryRaw<Array<{ v: string }>>`
-    SELECT COALESCE(SUM("amountPaise"::numeric), 0)::text AS v
+  // Revenue/tax parity (MEDIUM informational):
+  //
+  // For any correctly-posted ledger, the issuance-side AR activity
+  // (Dr AR from INVOICE_ISSUED net of Cr AR from INVOICE_VOIDED issuance
+  // reversals) must equal net Cr REVENUE + net Cr TAX_PAYABLE − net Dr
+  // DISCOUNT_CONTRA across those same issuance/void events.
+  //
+  // We deliberately exclude INVOICE_PAID / PAYMENT_REVERSED / VOID-payment
+  // legs because they only move cash↔AR and never touch REVENUE/TAX;
+  // including them caused false positives whenever a refund/chargeback
+  // posted a PAYMENT_REVERSED (Dr AR, Cr CASH).
+  //
+  // This drifts when an invoice is edited after issuance (ledger is
+  // append-only; to correct totals you must VOID+reissue), which is why
+  // it is MEDIUM rather than HIGH.
+  // Use string-literal IN list (Prisma.join does not mix well with enum
+  // columns in raw queries; the eventType values are hard-coded here and
+  // come from the ledger.ts builders, not from user input).
+  const issuanceRows = await tx.$queryRaw<
+    Array<{ account: string; signed_balance: string }>
+  >`
+    SELECT account,
+           COALESCE(SUM(
+             CASE
+               WHEN side = 'DEBIT'  THEN  "amountPaise"::numeric
+               WHEN side = 'CREDIT' THEN -"amountPaise"::numeric
+               ELSE 0
+             END
+           ), 0)::text AS signed_balance
     FROM ledger_entries
     WHERE "userId" = ${tenantId}
-      AND account = 'ACCOUNTS_RECEIVABLE' AND side = 'DEBIT'
+      AND "eventType" IN ('INVOICE_ISSUED'::"LedgerEventType", 'INVOICE_VOIDED'::"LedgerEventType")
+      AND account IN ('ACCOUNTS_RECEIVABLE'::"AccountType",
+                      'REVENUE'::"AccountType",
+                      'TAX_PAYABLE'::"AccountType",
+                      'DISCOUNT_CONTRA'::"AccountType")
+    GROUP BY account
   `;
-  const arTotalDr = BigInt(arDrRow[0]?.v ?? "0");
-  // AR Dr total should equal netRevenueCr + taxCr (gross total invoiced, before payments).
-  const expectedArDr = netRevenueCr + taxCr;
-  if (arTotalDr !== expectedArDr) {
+  const iss: Record<string, bigint> = {};
+  for (const r of issuanceRows) iss[r.account] = BigInt(r.signed_balance);
+  const issArDrMinusCr = iss.ACCOUNTS_RECEIVABLE ?? BigInt(0);            // should be ≥ 0 (Dr)
+  const issRevenueCr   = -(iss.REVENUE ?? BigInt(0));                     // -signed(Cr)
+  const issTaxCr       = -(iss.TAX_PAYABLE ?? BigInt(0));
+  const issDiscountDr  = iss.DISCOUNT_CONTRA ?? BigInt(0);                // Dr > 0
+  const expectedIssuedAr = issRevenueCr + issTaxCr - issDiscountDr;       // net issuance gross
+  if (issArDrMinusCr !== expectedIssuedAr) {
     discrepancies.push(
       mkDisc("REVENUE_TAX_MISMATCH", {
-        expectedPaise: expectedArDr.toString(),
-        actualPaise: arTotalDr.toString(),
-        diffPaise: (arTotalDr - expectedArDr).toString(),
-        detail: "Revenue+Tax credits do not match total AR debits (likely post-issuance edits)",
+        expectedPaise: expectedIssuedAr.toString(),
+        actualPaise: issArDrMinusCr.toString(),
+        diffPaise: (issArDrMinusCr - expectedIssuedAr).toString(),
+        detail: "Issuance-side AR does not match Revenue+Tax−Discount (likely post-issuance invoice edits; void+reissue to correct)",
       })
     );
   }
@@ -529,6 +539,13 @@ export interface ReconcileOptions {
   mode?: "incremental" | "full" | "single";
   /** Set true to skip auto-backfill (used by release/recheck paths). */
   skipAutoBackfill?: boolean;
+  /**
+   * Set true to record audit results WITHOUT flipping the quarantine flag
+   * or firing alerts. Used immediately after a force-release so the
+   * confirmation run logs the remaining drift but does not re-quarantine
+   * the tenant the operator just explicitly cleared.
+   */
+  auditOnly?: boolean;
 }
 
 export interface ReconcileResult {
@@ -732,10 +749,10 @@ export async function reconcileTenant(
     );
     if (hasBackfillable && !hasCriticalStructural && !opts.skipAutoBackfill) {
       try {
-        // backfillLedger runs as app_user per-tenant (not inside this
-        // service tx — commits independently). Safe because it is
-        // idempotent and only appends missing entries.
-        await backfillLedgerForSingleTenant(tenantId);
+        // Backfill INSIDE this service tx so the subsequent Sweep A+B
+        // re-reads can see the newly appended rows (REPEATABLE READ
+        // would otherwise hide rows committed on a different connection).
+        await backfillLedgerForSingleTenant(tenantId, tx);
         // Re-run Sweep A+B against the updated state.
         const sa2 = await sweepA(tx, tenantId, batchSize);
         const sb2 = await sweepB(tx, tenantId, sa2);
@@ -771,7 +788,8 @@ export async function reconcileTenant(
     const status: ReconciliationStatus = statusFrom(discrepancies, t.critical > 0);
 
     // Quarantine decision: CRITICAL → yes; HIGH → yes. MEDIUM/INFO → no.
-    const shouldQuarantine = t.critical > 0 || t.high > 0;
+    // Skipped entirely when `auditOnly` is set (post-force-release confirm run).
+    const shouldQuarantine = (t.critical > 0 || t.high > 0) && !opts.auditOnly;
     const alreadyQuarantined = !!user.ledgerQuarantinedAt;
     let quarantined = false;
     if (shouldQuarantine && !alreadyQuarantined) {
@@ -789,16 +807,19 @@ export async function reconcileTenant(
       quarantined = true;
     }
 
-    // Always update lastReconciledAt.
-    await tx.user.update({
-      where: { id: tenantId },
-      data: { lastReconciledAt: new Date() },
-    });
+    // Always update lastReconciledAt (skipped in audit-only confirm runs).
+    if (!opts.auditOnly) {
+      await tx.user.update({
+        where: { id: tenantId },
+        data: { lastReconciledAt: new Date() },
+      });
+    }
 
     // Create audit row.
     const dur = Date.now() - started;
     let triggeredAlert = false;
-    if (t.critical > 0 || t.high > 0 || quarantined || autoRemediated || t.info > 0) {
+    // Audit-only confirm runs do not fire alerts (operator already knows).
+    if (!opts.auditOnly && (t.critical > 0 || t.high > 0 || quarantined || autoRemediated || t.info > 0)) {
       // Cooldown is queried against the in-tx client via AuditFindCapable;
       // structural typing accepts any Prisma client or tx.
       type AuditClient = Parameters<typeof fireDriftAlerts>[1];
@@ -864,30 +885,34 @@ export async function reconcileTenant(
  * shim that does the same discovery the full backfill does, filtered
  * to one tenant.
  */
-async function backfillLedgerForSingleTenant(tenantId: string): Promise<{
+export async function backfillLedgerForSingleTenant(
+  tenantId: string,
+  tx?: Prisma.TransactionClient
+): Promise<{
   invoices: number;
   expenses: number;
 }> {
   // We import the single-event post function lazily to avoid cycles.
   const { postLedgerEvent } = await import("@/lib/ledger");
+  // When running inside an outer reconciler tx we pass `tx` down so the
+  // new ledger rows join the same transaction and subsequent in-tx
+  // Sweep A+B calls can see them (without this, REPEATABLE READ means
+  // the outer tx would keep its snapshot and miss backfilled rows).
+  const runIn = tx;
+  const prismaClient = tx ?? prisma;
   let invoicesCount = 0;
   let expensesCount = 0;
 
   // ---- Invoices ----
-  // An invoice that is past DRAFT must have an INVOICE_ISSUED event; an
-  // invoice that is PAID must additionally have an INVOICE_PAID event;
-  // an invoice that is VOID must have an INVOICE_VOIDED event (we only
-  // reverse issuance here — payment reversal for PAID→VOID requires the
-  // full pre-edit-items path, which is a narrower edge case).
-  const issued = await prisma.ledgerEntry.findMany({
+  const issued = await prismaClient.ledgerEntry.findMany({
     where: { userId: tenantId, eventType: "INVOICE_ISSUED", invoiceId: { not: null } },
     select: { invoiceId: true },
   });
-  const paid = await prisma.ledgerEntry.findMany({
+  const paid = await prismaClient.ledgerEntry.findMany({
     where: { userId: tenantId, eventType: "INVOICE_PAID", invoiceId: { not: null } },
     select: { invoiceId: true },
   });
-  const voided = await prisma.ledgerEntry.findMany({
+  const voided = await prismaClient.ledgerEntry.findMany({
     where: { userId: tenantId, eventType: "INVOICE_VOIDED", invoiceId: { not: null } },
     select: { invoiceId: true },
   });
@@ -895,7 +920,7 @@ async function backfillLedgerForSingleTenant(tenantId: string): Promise<{
   const alreadyPaid = new Set(paid.map((r) => r.invoiceId).filter(Boolean) as string[]);
   const alreadyVoided = new Set(voided.map((r) => r.invoiceId).filter(Boolean) as string[]);
 
-  const invoices = await prisma.invoice.findMany({
+  const invoices = await prismaClient.invoice.findMany({
     where: { userId: tenantId, status: { not: "DRAFT" } },
     include: { items: true },
   });
@@ -916,40 +941,49 @@ async function backfillLedgerForSingleTenant(tenantId: string): Promise<{
 
     let posted = false;
     if (!alreadyIssued.has(inv.id)) {
-      await postLedgerEvent({ type: "INVOICE_ISSUED", invoice: invoiceDraft });
+      await postLedgerEvent({ type: "INVOICE_ISSUED", invoice: invoiceDraft }, runIn);
       posted = true;
     }
     if (inv.status === "PAID" && !alreadyPaid.has(inv.id)) {
-      await postLedgerEvent({
-        type: "INVOICE_PAID",
-        invoice: { id: inv.id, userId: inv.userId, totalAmount: inv.totalAmount },
-        amountPaid: inv.totalAmount,
-      });
+      await postLedgerEvent(
+        {
+          type: "INVOICE_PAID",
+          invoice: { id: inv.id, userId: inv.userId, totalAmount: inv.totalAmount },
+          amountPaid: inv.totalAmount,
+        },
+        runIn
+      );
       posted = true;
     } else if (inv.status === "VOID" && !alreadyVoided.has(inv.id)) {
-      await postLedgerEvent({
-        type: "INVOICE_VOIDED",
-        invoice: { ...invoiceDraft, paidAmount: null },
-      });
+      await postLedgerEvent(
+        {
+          type: "INVOICE_VOIDED",
+          invoice: { ...invoiceDraft, paidAmount: null },
+        },
+        runIn
+      );
       posted = true;
     }
     if (posted) invoicesCount++;
   }
 
   // ---- Expenses ----
-  const expensed = await prisma.ledgerEntry.findMany({
+  const expensed = await prismaClient.ledgerEntry.findMany({
     where: { userId: tenantId, eventType: "EXPENSE_RECORDED", expenseId: { not: null } },
     select: { expenseId: true },
   });
   const alreadyExpensed = new Set(expensed.map((r) => r.expenseId).filter(Boolean) as string[]);
-  const expenses = await prisma.expense.findMany({
+  const expenses = await prismaClient.expense.findMany({
     where: { userId: tenantId, NOT: { id: { in: Array.from(alreadyExpensed) } } },
   });
   for (const exp of expenses) {
-    await postLedgerEvent({
-      type: "EXPENSE_RECORDED",
-      expense: { id: exp.id, userId: exp.userId, amount: exp.amount, category: exp.category },
-    });
+    await postLedgerEvent(
+      {
+        type: "EXPENSE_RECORDED",
+        expense: { id: exp.id, userId: exp.userId, amount: exp.amount, category: exp.category },
+      },
+      runIn
+    );
     expensesCount++;
   }
 
@@ -1109,7 +1143,13 @@ export async function releaseQuarantine(
       },
     });
   });
-  const result = await reconcileTenant(tenantId, { skipAutoBackfill: true });
+  // Post-release confirmation run. On force-release the operator has
+  // explicitly accepted residual drift; run in auditOnly mode so this
+  // run records an audit row but does NOT re-quarantine or fire alerts.
+  const result = await reconcileTenant(tenantId, {
+    skipAutoBackfill: !opts.force, // try backfill once after a normal release
+    auditOnly: !!opts.force,
+  });
   return { ok: true, result };
 }
 
@@ -1118,6 +1158,8 @@ export async function operatorBackfill(tenantId: string): Promise<{
   expenses: number;
   result: ReconcileResult;
 }> {
+  // operatorBackfill is invoked from Server Actions outside any outer tx,
+  // so it's safe to use the global prisma (no tx argument).
   const r = await backfillLedgerForSingleTenant(tenantId);
   const result = await reconcileTenant(tenantId, { skipAutoBackfill: true });
   return { invoices: r.invoices, expenses: r.expenses, result };

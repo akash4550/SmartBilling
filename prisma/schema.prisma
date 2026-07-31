@@ -573,6 +573,10 @@ model LedgerEntry {
   @@index([userId, eventId])
   @@index([invoiceId])
   @@index([expenseId])
+  // Composite indexes covering Sweep B aggregate queries (GROUP BY account /
+  // eventType / side per tenant) to keep reconcile latency flat past 100k rows.
+  @@index([userId, account, side])
+  @@index([userId, account, eventType])
   @@unique([userId, entryIndex])
   @@unique([userId, entryHash])
   @@map("ledger_entries")
