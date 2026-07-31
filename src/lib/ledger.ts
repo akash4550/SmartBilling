@@ -30,11 +30,20 @@
  *   CASH                (asset)     Dr when payment received, Cr for expenses
  *   EXPENSES            (expense)   Dr when expense recorded
  */
+import "server-only";
+
 import crypto from "node:crypto";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { withTenant } from "@/lib/tenant";
 import { calcInvoiceTotals, toSubunit } from "@/lib/money";
+import { LedgerQuarantinedError } from "@/lib/errors";
+
+// Re-export for backwards compatibility. Some callers (integration tests,
+// webhook processors, catch blocks) import this from @/lib/ledger; the
+// canonical class lives in @/lib/errors so instanceof checks across
+// modules agree.
+export { LedgerQuarantinedError };
 
 /** sha256("smartbill:ledger:genesis") — anchor prevEntryHash for user index 1. */
 export const GENESIS_HASH = crypto
@@ -82,8 +91,18 @@ export type LedgerEventInput =
         taxRate: number;
         discountType?: "PERCENT" | "FIXED" | null;
         discountValue?: number | null;
-        /** If the invoice had been PAID, pass totalAmount to reverse payment too. */
-        paidAmount?: Prisma.Decimal | number | string | null;
+        /**
+         * Cash amount (paise) to reverse as part of this void. Pass the
+         * exact amount of CASH previously posted for this invoice (sum of
+         * INVOICE_PAID Dr minus PAYMENT_REVERSED Cr). Use
+         * `resolveCashPaidForInvoice()` to derive this from existing
+         * ledger entries so partial payments, multiple payments, and
+         * post-void reversals all cancel out cleanly.
+         *
+         * If omitted/nullish and zero, no cash reversal is posted (correct
+         * for voiding a PENDING invoice that never received payment).
+         */
+        paidAmount?: Prisma.Decimal | number | string | bigint | null;
         currency?: string;
       };
     }
@@ -135,25 +154,12 @@ export function serializeForHash(input: {
 }
 
 /**
- * Thrown when a financial write is attempted against a quarantined tenant.
- * The reconciler flips users.ledgerQuarantinedAt on CRITICAL/HIGH drift;
- * withTenant() / postLedgerEvent(s) refuse further writes as a first line
- * of defense (the Postgres ledger_quarantine_guard() trigger is third).
+ * Check quarantine flag outside of a tenant tx (as superuser). Throws
+ * the canonical LedgerQuarantinedError (from @/lib/errors) if the tenant
+ * is currently locked out of writes. withTenant() / postLedgerEvent(s)
+ * refuse further writes as a first line of defense; the Postgres
+ * ledger_quarantine_guard() trigger is the third.
  */
-export class LedgerQuarantinedError extends Error {
-  public readonly userId: string;
-  public readonly reason: string | null;
-  constructor(userId: string, reason: string | null) {
-    super(
-      `Ledger quarantined for tenant ${userId} (reason=${reason ?? "unspecified"})`
-    );
-    this.name = "LedgerQuarantinedError";
-    this.userId = userId;
-    this.reason = reason;
-  }
-}
-
-/** Check quarantine flag outside of a tenant tx (as superuser). */
 async function assertNotQuarantined(userId: string, client: Pick<typeof prisma, "user"> = prisma) {
   const u = await client.user.findUnique({
     where: { id: userId },
@@ -169,11 +175,53 @@ async function assertNotQuarantined(userId: string, client: Pick<typeof prisma, 
 // ============================================================
 
 function toPaise(
-  v: Prisma.Decimal | number | string | null | undefined,
+  v: Prisma.Decimal | number | string | bigint | null | undefined,
   currency: string
 ): bigint {
   if (v === null || v === undefined) return BigInt(0);
+  if (typeof v === "bigint") return v;
   return BigInt(toSubunit(v as Prisma.Decimal | number | string, currency));
+}
+
+/**
+ * Compute the NET CASH that has been posted so far for an invoice, by
+ * summing signed CASH movements across INVOICE_PAID (+), PAYMENT_REVERSED
+ * (−), and any prior INVOICE_VOIDED cash legs (−). Used by the void flow
+ * so that voiding a partially-paid invoice (or voiding an invoice that
+ * has already had a chargeback) reverses exactly the outstanding cash
+ * amount, keeping CASH and AR nets at zero without over-reversing.
+ *
+ * Returns 0n when there are no cash rows (PENDING invoice voided without
+ * payment) or when the invoice can't be found.
+ *
+ * Accepts an optional tx client for composing inside an outer transaction;
+ * otherwise uses the global prisma client. Runs under the caller's role
+ * (callers open their own withTenant / withService context).
+ */
+export async function resolveCashPaidForInvoice(
+  invoiceId: string,
+  userId: string,
+  tx?: Pick<
+    typeof prisma,
+    "ledgerEntry"
+  >
+): Promise<bigint> {
+  const client = tx ?? prisma;
+  const rows = await client.ledgerEntry.findMany({
+    where: {
+      userId,
+      invoiceId,
+      account: "CASH",
+      eventType: { in: ["INVOICE_PAID", "PAYMENT_REVERSED", "INVOICE_VOIDED"] },
+    },
+    select: { side: true, amountPaise: true },
+  });
+  let net = BigInt(0);
+  for (const r of rows) {
+    const amt = BigInt(r.amountPaise.toString());
+    net += r.side === "DEBIT" ? amt : -amt;
+  }
+  return net < BigInt(0) ? BigInt(0) : net;
 }
 
 function buildEntriesFor(ev: LedgerEventInput): {
@@ -241,7 +289,41 @@ function buildEntriesFor(ev: LedgerEventInput): {
       const totalP = BigInt(totals._paise.total);
       const netP = subtotalP - discountP;
 
-      // Reverse the INVOICE_ISSUED posting.
+      // Net cash previously received for this invoice (from prior
+      // INVOICE_PAID less any PAYMENT_REVERSED). Passed in by the caller
+      // (see resolveCashPaidForInvoice) so partial payments, multiple
+      // payments, and post-payment chargebacks all reverse correctly.
+      // Clamp to [0, totalP] defensively: if more cash was posted than
+      // the invoice total (which shouldn't happen via our helpers but
+      // could via raw SQL), we reverse exactly the invoice total so
+      // books stay balanced and the excess is visible as a CASH_MISMATCH
+      // rather than generating a negative AR balance.
+      let paidP = toPaise(ev.invoice.paidAmount, cur);
+      if (paidP < BigInt(0)) paidP = BigInt(0);
+      if (paidP > totalP) paidP = totalP;
+
+      // Open (unpaid) AR at the moment of void. Crediting AR by this
+      // amount zeros out the remaining receivable balance that was
+      // created by INVOICE_ISSUED and never closed by INVOICE_PAID.
+      const openArP = totalP - paidP;
+
+      // --- Build balanced reversing entries ---
+      //
+      // Strategy: mirror-image of the original INVOICE_ISSUED posting
+      // (every debit becomes a credit and vice versa so the issuance is
+      // exactly nullified), PLUS a mirror of the INVOICE_PAID /
+      // PAYMENT_REVERSED net cash effect (paidP of CASH debited → now
+      // credited, AR credited → now debited by paidP).
+      //
+      // For a PENDING invoice (paidP=0): this is just the ISUED reversal.
+      //   Dr REVENUE netP / Dr TAX_PAYABLE taxP / Cr DISCOUNT_CONTRA (if any)
+      //   / Cr AR totalP.
+      // For a fully-paid invoice (paidP=totalP): AR nets to zero after
+      //   the cash-reversal debit, cash nets to zero.
+      // For a partial payment: open receivable = totalP - paidP is
+      //   credited by the ISUED-mirror leg, and paidP is re-debited by
+      //   the cash-reversal leg — AR nets to zero and CASH reverses to
+      //   zero the prior Dr.
       const entries: EntryDraft[] = [
         { account: "REVENUE",             side: "DEBIT",  amountPaise: netP },
         { account: "TAX_PAYABLE",         side: "DEBIT",  amountPaise: taxP },
@@ -251,16 +333,14 @@ function buildEntriesFor(ev: LedgerEventInput): {
         entries.push({ account: "DISCOUNT_CONTRA", side: "CREDIT", amountPaise: discountP });
       }
       let note = "Invoice voided (issuance reversed)";
-      if (ev.invoice.paidAmount != null) {
-        // Reverse the payment too (refund / chargeback).
-        const paidP = toPaise(ev.invoice.paidAmount, cur);
-        if (paidP > BigInt(0)) {
-          entries.push(
-            { account: "ACCOUNTS_RECEIVABLE", side: "DEBIT",  amountPaise: paidP },
-            { account: "CASH",               side: "CREDIT", amountPaise: paidP }
-          );
-          note += " (payment reversed)";
-        }
+      if (paidP > BigInt(0)) {
+        entries.push(
+          { account: "ACCOUNTS_RECEIVABLE", side: "DEBIT",  amountPaise: paidP },
+          { account: "CASH",               side: "CREDIT", amountPaise: paidP }
+        );
+        note += openArP > BigInt(0)
+          ? " (partial payment reversed; remaining balance written off)"
+          : " (payment reversed)";
       }
       return { entries, invoiceId: ev.invoice.id, expenseId: null, currency: cur, note };
     }
@@ -713,9 +793,15 @@ export async function backfillLedger(): Promise<{
           amountPaid: inv.totalAmount,
         });
       } else if (inv.status === "VOID") {
-        // We don't know whether it was paid at the time of void from
-        // current state; issue a simple reversal (no payment reversal)
-        // so the books stay balanced.
+        // If INVOICE_PAID entries were already posted for this invoice
+        // (e.g., backfill re-run after a partial failure), reverse that
+        // cash too; otherwise reverse just the issuance so books balance.
+        // We run inside withTenant as each postLedgerEvent does;
+        // resolveCashPaidForInvoice runs as superuser for discovery.
+        // Because we are running sequentially inside backfillLedger and
+        // INVOICE_PAID is posted above only if not alreadyPaid, net cash
+        // here is either 0 (never paid) or totalAmount (fully paid).
+        const existingCash = await resolveCashPaidForInvoice(inv.id, inv.userId);
         await postLedgerEvent({
           type: "INVOICE_VOIDED",
           invoice: {
@@ -725,7 +811,7 @@ export async function backfillLedger(): Promise<{
             taxRate: Number(inv.taxRate),
             discountType: inv.discountType,
             discountValue: inv.discountValue != null ? Number(inv.discountValue) : null,
-            paidAmount: null,
+            paidAmount: existingCash > BigInt(0) ? existingCash : null,
           },
         });
       }

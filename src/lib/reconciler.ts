@@ -5,17 +5,26 @@
  *   Sweep A — Streaming hash-chain integrity + per-event balance check.
  *             Cursor-batched (default 500 rows/query) from entryIndex = 1
  *             using the (userId, entryIndex) UNIQUE index. Constant memory.
- *   Sweep B — SQL-side balance cross-checks against invoice/expense tables.
- *             Aggregations pushed down to Postgres to avoid streaming the
- *             entire ledger to Node.
+ *             Tail-catch-up loop (capped 5 iters) handles rows appended
+ *             mid-sweep without forking the chain.
+ *   Sweep B — SQL-side balance cross-checks against the read model
+ *             (invoices / expenses) and issuance-scoped revenue/tax parity.
+ *             Aggregations pushed down to Postgres.
  *
- * Every run writes one append-only row to reconciliation_audits.
- * CRITICAL/HIGH drift trips users.ledgerQuarantinedAt (fail-closed).
- * AR/CASH/EXPENSE mismatches get ONE auto-backfill attempt before escalation.
+ * Every run writes one append-only row to reconciliation_audits (UPDATE/
+ * DELETE revoked at the SQL layer). CRITICAL drift immediately
+ * quarantines; HIGH drift (AR/CASH/EXPENSE mismatches) gets ONE idempotent
+ * auto-backfill attempt INSIDE the service tx (REPEATABLE READ snapshot
+ * visibility) before escalation; MEDIUM/INFO do not block writes.
  *
- * Runs as service_role under service name "maint:reconcile". Never runs as
- * app_user (needs cross-tenant discovery) and never runs as superuser.
+ * Runs as service_role under service name "maint:reconcile". Never as
+ * app_user (needs cross-tenant discovery) and never as superuser.
+ * Concurrency per tenant is guarded by pg_try_advisory_xact_lock in
+ * namespace 1397772901 (separate from ledger-posting namespace 1397772900);
+ * contention returns TRANSIENT_FAILURE cleanly (no queueing).
  */
+import "server-only";
+
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { withService } from "@/lib/service-context";
@@ -31,19 +40,52 @@ import {
   ensureDefaultDriftAlertHook,
   fireDriftAlerts,
 } from "@/lib/reconciler-alerts";
+import { isReadOnlyMode } from "@/lib/dr-mode";
+import {
+  ReadOnlyModeError,
+  LedgerQuarantinedError,
+} from "@/lib/errors";
 import type { ReconciliationStatus } from "@prisma/client";
 
-export { LedgerQuarantinedError } from "@/lib/ledger";
+// Re-exports for backwards compatibility — callers historically did
+// `import { LedgerQuarantinedError } from "@/lib/reconciler"` in tests
+// and Server Actions. The canonical classes live in @/lib/errors.
+export { LedgerQuarantinedError, ReadOnlyModeError };
 export type { Discrepancy, DriftKind, Severity };
-
 export const RECONCILER_VERSION = "1";
 const RECONCILER_SERVICE = "maint:reconcile";
 const DEFAULT_BATCH = 500;
-const RECONCILE_LOCK_NS = BigInt(1397772901); // separate from ledger posting lock
+const TAIL_CATCHUP_MAX_ITERS = 5;
+/**
+ * Per-tenant reconcile advisory-lock namespace. MUST be distinct from
+ * the ledger-posting namespace (1397772900n) so reconciles do not block
+ * posting and vice versa. The lock is transaction-scoped and acquired
+ * with pg_try_advisory_xact_lock so concurrent invocations bail fast.
+ */
+const RECONCILE_LOCK_NS = BigInt(1397772901);
+
+/**
+ * Event types that legitimately post to the CASH account. Any CASH row
+ * outside this set indicates a bug in the posting path (an event we
+ * did not anticipate touching cash) and is flagged as HIGH drift.
+ *
+ *   INVOICE_PAID       → Dr CASH, Cr AR  (customer payment)
+ *   PAYMENT_REVERSED   → Dr AR,   Cr CASH (refund / chargeback)
+ *   EXPENSE_RECORDED   → Dr EXP,  Cr CASH (cash outflow)
+ *   INVOICE_VOIDED     → may include Cr CASH when a paid invoice is
+ *                        voided (payment reversed inside the void)
+ */
+const CASH_EVENT_TYPES = [
+  "INVOICE_PAID",
+  "PAYMENT_REVERSED",
+  "EXPENSE_RECORDED",
+  "INVOICE_VOIDED",
+] as const;
 
 /** Advisory lock key (per-tenant reconcile serialization). */
 function reconcileAdvisoryKeyFor(tenantId: string): bigint {
-  // FNV-1a 32-bit folded into low 32 bits; high 32 is the reconcile namespace.
+  // FNV-1a 32-bit folded into low 32 bits; high 32 bits are the namespace.
+  // Constructed arithmetically (not as a literal) to satisfy ES2017.
   let h = 0x811c9dc5;
   for (let i = 0; i < tenantId.length; i++) {
     h ^= tenantId.charCodeAt(i);
@@ -66,11 +108,11 @@ function classify(kind: DriftKind): Severity {
     case "HASH_CHAIN_BROKEN":
     case "TAIL_POINTER_DESYNC":
     case "UNBALANCED_EVENT":
+    case "ENTRY_INDEX_GAP":
       return "CRITICAL";
     case "AR_MISMATCH":
     case "CASH_MISMATCH":
     case "EXPENSE_MISMATCH":
-    case "ENTRY_INDEX_GAP":
       return "HIGH";
     case "REVENUE_TAX_MISMATCH":
       return "MEDIUM";
@@ -111,10 +153,21 @@ interface SweepAResult {
   discrepancies: Discrepancy[];
   tailHash: string | null;
   tailIndex: number;
-  /** Account balances (Σ D − Σ C) as paise BigInts. */
+  /** Account signed balances (Σ D − Σ C) as paise BigInts. */
   accountBalances: Record<string, bigint>;
 }
 
+/**
+ * Stream ledger entries forward from entryIndex 1 using a keyset cursor.
+ * Verifies:
+ *   1. No entryIndex gaps (deletion / skipped-index detection).
+ *   2. prevEntryHash chain links (matches in-memory running hash).
+ *   3. SHA-256(prevHash | canonical_json) === entryHash — REUSES the
+ *      canonical serializer from ledger.ts (no second implementation).
+ *   4. Per-eventId Σ Debit ≡ Σ Credit.
+ * Runs up to TAIL_CATCHUP_MAX_ITERS passes to converge with concurrent
+ * appenders (new rows written between our last batch and EOF check).
+ */
 async function sweepA(
   tx: Prisma.TransactionClient,
   tenantId: string,
@@ -129,10 +182,17 @@ async function sweepA(
     CASH: BigInt(0),
     EXPENSES: BigInt(0),
   };
-  // Per-event d/c accumulator. Events are contiguous in our posting helper
-  // but we tolerate straddling a batch boundary (events aren't evicted
-  // until finalization; worst-case one extra event in memory).
-  const eventBalances = new Map<string, { d: bigint; c: bigint; lastIndex: number }>();
+  /**
+   * Per-event D/C accumulator. Events are always posted contiguously in
+   * our ledger helper (same eventId rows appear consecutively in a single
+   * chain append), but we tolerate straddling a batch boundary because
+   * we don't evict until finalization — memory footprint is bounded by
+   * the number of in-flight events (≤ 2 across a boundary in practice).
+   */
+  const eventBalances = new Map<
+    string,
+    { d: bigint; c: bigint; lastIndex: number }
+  >();
 
   let cursor = 0;
   let prevHash = GENESIS_HASH;
@@ -142,10 +202,7 @@ async function sweepA(
   let tailHash: string | null = null;
   let tailIndex = 0;
 
-  // Tail-catch-up loop: if new entries were appended during our scan
-  // (concurrent writes), we loop once more to advance to the new tail.
-  // Cap iterations as a safety valve against infinite catch-up.
-  for (let catchup = 0; catchup < 5; catchup++) {
+  for (let catchup = 0; catchup < TAIL_CATCHUP_MAX_ITERS; catchup++) {
     while (true) {
       const batch = (await tx.ledgerEntry.findMany({
         where: { userId: tenantId, entryIndex: { gt: cursor } },
@@ -170,29 +227,29 @@ async function sweepA(
       if (batch.length === 0) break;
 
       for (const row of batch) {
-        // Entry index gap check — detects deleted / skipped entries.
+        // --- Entry index gap (deleted / skipped rows) ---
         if (row.entryIndex !== expectedNextIndex) {
           discrepancies.push(
             mkDisc("ENTRY_INDEX_GAP", {
               detail: `expected index ${expectedNextIndex}, got ${row.entryIndex}`,
             })
           );
-          if (!firstBrokenIndex) firstBrokenIndex = row.entryIndex;
-          // Resync expected to row.index+1 so we continue collecting.
+          if (firstBrokenIndex === null) firstBrokenIndex = row.entryIndex;
+          // Resync forward so we continue collecting discrepancies
+          // rather than emitting cascading false positives.
           expectedNextIndex = row.entryIndex;
         }
         expectedNextIndex++;
 
-        // Hash chain check.
+        // --- Hash chain: prevEntryHash must equal running hash ---
         if (row.prevEntryHash !== prevHash) {
           discrepancies.push(
             mkDisc("HASH_CHAIN_BROKEN", {
               detail: `at index ${row.entryIndex}: prevEntryHash mismatch (expected ${prevHash.slice(0, 12)}… got ${row.prevEntryHash.slice(0, 12)}…)`,
             })
           );
-          if (!firstBrokenIndex) firstBrokenIndex = row.entryIndex;
-          // Re-sync to this row's claimed hash to avoid cascading false
-          // positives from a single broken link.
+          if (firstBrokenIndex === null) firstBrokenIndex = row.entryIndex;
+          // Re-sync to this row's claimed hash to contain the blast radius.
           prevHash = row.entryHash;
         } else {
           const canon = serializeForHash({
@@ -212,22 +269,19 @@ async function sweepA(
                 detail: `at index ${row.entryIndex}: entryHash mismatch (expected ${expectedHash.slice(0, 12)}… got ${row.entryHash.slice(0, 12)}…)`,
               })
             );
-            if (!firstBrokenIndex) firstBrokenIndex = row.entryIndex;
+            if (firstBrokenIndex === null) firstBrokenIndex = row.entryIndex;
             prevHash = row.entryHash;
           } else {
             prevHash = row.entryHash;
           }
         }
 
-        // Running signed balance.
+        // --- Running signed balance per account ---
         const amt = BigInt(row.amountPaise.toString());
-        if (row.side === "DEBIT") {
-          balances[row.account] = (balances[row.account] ?? BigInt(0)) + amt;
-        } else {
-          balances[row.account] = (balances[row.account] ?? BigInt(0)) - amt;
-        }
+        const signed = row.side === "DEBIT" ? amt : -amt;
+        balances[row.account] = (balances[row.account] ?? BigInt(0)) + signed;
 
-        // Per-event balance accumulator.
+        // --- Per-event D/C accumulator ---
         let eb = eventBalances.get(row.eventId);
         if (!eb) {
           eb = { d: BigInt(0), c: BigInt(0), lastIndex: 0 };
@@ -244,11 +298,12 @@ async function sweepA(
 
       cursor = batch[batch.length - 1].entryIndex;
 
-      // Yield to the event loop to keep the conn pool responsive.
+      // Yield to the event loop so long-running sweeps don't starve the
+      // connection pool.
       await new Promise((r) => setImmediate(r));
     }
 
-    // Tail check: has new data arrived?
+    // Tail check: has new data arrived since our last batch?
     const newest = await tx.ledgerEntry.findFirst({
       where: { userId: tenantId },
       orderBy: { entryIndex: "desc" },
@@ -256,20 +311,18 @@ async function sweepA(
     });
     if (!newest) break;
     if (newest.entryIndex <= cursor) break; // caught up
-    // else loop again, continue scanning from cursor.
+    // else loop again and resume from cursor.
   }
 
-  // Finalize per-event balance checks. Events never straddle batch
-  // boundaries under normal posting (entries for a given event are
-  // contiguous), but we check all events regardless.
+  // --- Finalize per-event balance checks ---
   for (const [eventId, b] of eventBalances) {
     if (b.d !== b.c) {
       discrepancies.push(
         mkDisc("UNBALANCED_EVENT", {
-          detail: `eventId=${eventId} ΣD=${b.d}p ΣC=${b.c}p`,
+          detail: `eventId=${eventId} ΣD=${b.d.toString()}p ΣC=${b.c.toString()}p`,
         })
       );
-      if (!firstBrokenIndex) firstBrokenIndex = b.lastIndex;
+      if (firstBrokenIndex === null) firstBrokenIndex = b.lastIndex;
     }
   }
 
@@ -284,19 +337,40 @@ async function sweepA(
 }
 
 // ============================================================
-// SWEEP B — SQL-side balance cross-check
+// SWEEP B — SQL-side balance cross-checks
 // ============================================================
 
 interface SweepBResult {
   discrepancies: Discrepancy[];
   expectedOpenReceivablePaise: bigint;
-  expectedPaidCashPaise: bigint;
   expectedExpensePaise: bigint;
 }
 
 /**
- * Compute ledger-side balances (single GROUP BY) and read-model
- * expectations (targeted SUM aggregates) in parallel; compare.
+ * Build a SQL IN (...) clause for a fixed list of string literals. We
+ * deliberately avoid parameterizing these (they are hard-coded enum
+ * values in this file, never user input) so that Postgres sees a plain
+ * literal IN list and doesn't require enum casts.
+ */
+function literalInList(values: readonly string[]): string {
+  return values.map((v) => `'${v.replace(/'/g, "''")}'`).join(", ");
+}
+
+/**
+ * Sweep B pushes aggregations down to Postgres.
+ *
+ *  1. Ledger-side per-account signed balances — ground truth.
+ *  2. AR expected balance = Σ ROUND(totalAmount * 100) for invoices
+ *     with status = 'PENDING' (open receivable read model).
+ *  3. EXPENSES expected balance = Σ ROUND(amount * 100) from expenses.
+ *  4. CASH expected balance = Σ signed CASH movements scoped to the
+ *     event types that legitimately touch cash; any CASH posting
+ *     outside that set is flagged as HIGH drift.
+ *  5. Revenue/Tax parity scoped STRICTLY to INVOICE_ISSUED /
+ *     INVOICE_VOIDED events (issuance leg). Payments/refunds do NOT
+ *     touch REVENUE/TAX_PAYABLE in our posting model so they are
+ *     excluded from the parity check (prevents false positives after
+ *     refunds/chargebacks).
  */
 async function sweepB(
   tx: Prisma.TransactionClient,
@@ -305,9 +379,9 @@ async function sweepB(
 ): Promise<SweepBResult> {
   const discrepancies: Discrepancy[] = [];
 
-  // Ledger-side per-account aggregates.
-  // We cast amountPaise through text to avoid BigInt binding issues with
-  // $queryRaw; this returns stringified bigints.
+  // --- 1. Ledger-side per-account signed aggregates ---
+  // Cast amountPaise to numeric to avoid BigInt binding headaches with
+  // $queryRaw; result is returned as text and parsed to BigInt.
   const ledgerRows = await tx.$queryRaw<
     Array<{
       account: string;
@@ -319,7 +393,9 @@ async function sweepB(
     SELECT account,
            COALESCE(SUM(CASE WHEN side='DEBIT'  THEN "amountPaise"::numeric ELSE 0 END), 0)::text AS total_debits,
            COALESCE(SUM(CASE WHEN side='CREDIT' THEN "amountPaise"::numeric ELSE 0 END), 0)::text AS total_credits,
-           COALESCE(SUM(CASE WHEN side='DEBIT'  THEN "amountPaise"::numeric ELSE -"amountPaise"::numeric END), 0)::text AS signed_balance
+           COALESCE(SUM(CASE WHEN side='DEBIT'  THEN  "amountPaise"::numeric
+                             WHEN side='CREDIT' THEN -"amountPaise"::numeric
+                             ELSE 0 END), 0)::text AS signed_balance
     FROM ledger_entries
     WHERE "userId" = ${tenantId}
     GROUP BY account
@@ -328,19 +404,12 @@ async function sweepB(
   for (const r of ledgerRows) {
     ledgerBalance[r.account] = BigInt(r.signed_balance);
   }
-  // Merge with zero defaults for accounts with no rows.
+  // Zero defaults for any account not present in the ledger.
   for (const k of Object.keys(sweepA.accountBalances)) {
     if (ledgerBalance[k] === undefined) ledgerBalance[k] = BigInt(0);
   }
 
-  // Read model aggregates:
-  //   open AR    → Σ totalAmount where status='PENDING' (debit balance).
-  //   cash       → Σ INVOICE_PAID Dr − Σ PAYMENT_REVERSED Cr − Σ void-payment
-  //                reversals (Cr CASH) − Σ EXPENSE_RECORDED Cr. This is
-  //                computed directly from ledger event types because
-  //                invoices.status = PAID alone cannot see refunds/chargebacks
-  //                posted via PAYMENT_REVERSED.
-  //   expenses   → Σ amount on expenses table (Dr EXPENSES).
+  // --- 2. Open AR (PENDING invoices) ---
   const invAgg = await tx.$queryRaw<
     Array<{ status: string; total_paise: string }>
   >`
@@ -351,13 +420,17 @@ async function sweepB(
     GROUP BY status
   `;
   let openReceivable = BigInt(0);
-  let paidCash = BigInt(0);
   for (const r of invAgg) {
-    const v = BigInt(r.total_paise);
-    if (r.status === "PENDING") openReceivable += v;
-    else if (r.status === "PAID") paidCash += v;
+    if (r.status === "PENDING") openReceivable += BigInt(r.total_paise);
+    // NOTE: we deliberately do NOT use invoices.status='PAID' as a
+    // cash expectation. Refunds/chargebacks (PAYMENT_REVERSED) and
+    // voids-of-paid (INVOICE_VOIDED with paidAmount set) reduce cash
+    // without flipping the invoice out of a state we can detect
+    // reliably from this aggregate. CASH is instead derived from the
+    // ledger's own event-type-signed sums (step 4).
   }
 
+  // --- 3. Expense read model ---
   const expAgg = await tx.$queryRaw<Array<{ total_paise: string }>>`
     SELECT COALESCE(SUM(ROUND((amount::numeric * 100))), 0)::text AS total_paise
     FROM expenses
@@ -365,13 +438,11 @@ async function sweepB(
   `;
   const expenseTotal = BigInt(expAgg[0]?.total_paise ?? "0");
 
-  // Expected CASH balance computed from the ledger's own CASH debits/credits
-  // partitioned by eventType. This catches PAYMENT_REVERSED and void-payment
-  // Cr flows that invoice.status = PAID would miss. Any posting path that
-  // touches CASH must use one of these event types, so this sum is the
-  // authoritative expected balance and must equal ledgerBalance.CASH.
-  const cashEvtRows = await tx.$queryRaw<
-    Array<{ event_type: string; total_paise: string }>
+  // --- 4. CASH expected = signed sum of CASH rows scoped to known cash
+  //        event types. Any CASH row outside the known set is drift.
+  const cashEvtInList = literalInList(CASH_EVENT_TYPES);
+  const cashRows = await tx.$queryRaw<
+    Array<{ event_type: string; signed_balance: string }>
   >`
     SELECT "eventType" AS event_type,
            COALESCE(SUM(
@@ -380,23 +451,45 @@ async function sweepB(
                WHEN side = 'CREDIT' THEN -"amountPaise"::numeric
                ELSE 0
              END
-           ), 0)::text AS total_paise
+           ), 0)::text AS signed_balance
     FROM ledger_entries
     WHERE "userId" = ${tenantId}
       AND account = 'CASH'
+      AND "eventType" IN (${Prisma.raw(cashEvtInList)})
     GROUP BY "eventType"
   `;
-  let expectedCash = BigInt(0);
-  for (const r of cashEvtRows) {
-    expectedCash += BigInt(r.total_paise);
+  let expectedCashFromKnownEvents = BigInt(0);
+  const seenCashEvents = new Set<string>();
+  for (const r of cashRows) {
+    expectedCashFromKnownEvents += BigInt(r.signed_balance);
+    seenCashEvents.add(r.event_type);
   }
 
-  // The ledger-side CASH balance equals Σ (Dr − Cr) across ALL CASH rows,
-  // which by construction equals Σ eventType-signed sums above. We still
-  // cross-check against the AR/expense read models below; the CASH event
-  // aggregate guards against accidental postings to CASH under an unknown
-  // event type (would also be caught by AR/revenue parity, but we surface
-  // it directly here).
+  // Detect unknown event types posting to CASH (high-sensitivity bug detector).
+  const unknownCashRows = await tx.$queryRaw<
+    Array<{ event_type: string; total_paise: string }>
+  >`
+    SELECT "eventType" AS event_type,
+           COALESCE(SUM("amountPaise"::numeric), 0)::text AS total_paise
+    FROM ledger_entries
+    WHERE "userId" = ${tenantId}
+      AND account = 'CASH'
+      AND "eventType" NOT IN (${Prisma.raw(cashEvtInList)})
+    GROUP BY "eventType"
+  `;
+  if (unknownCashRows.length > 0) {
+    const bad = unknownCashRows
+      .map((r) => `${r.event_type}=${r.total_paise}p`)
+      .join(", ");
+    discrepancies.push(
+      mkDisc("CASH_MISMATCH", {
+        account: "CASH",
+        detail: `CASH posted under unexpected event type(s): ${bad}`,
+      })
+    );
+  }
+
+  // --- Cross-check: AR ---
   const arLedger = ledgerBalance.ACCOUNTS_RECEIVABLE ?? BigInt(0);
   if (arLedger !== openReceivable) {
     discrepancies.push(
@@ -410,24 +503,23 @@ async function sweepB(
     );
   }
 
+  // --- Cross-check: CASH (ledger must equal sum-of-known-events) ---
   const cashLedger = ledgerBalance.CASH ?? BigInt(0);
-  // Sanity: event-type sum must equal ledger signed balance (internal
-  // consistency). If it doesn't, we have a ledger corruption (e.g. an
-  // account other than CASH posted to CASH rows, which shouldn't happen).
-  if (cashLedger !== expectedCash) {
+  if (cashLedger !== expectedCashFromKnownEvents && unknownCashRows.length === 0) {
+    // If unknown events already flagged, we still record the numeric gap
+    // but skip emitting a duplicate CASH_MISMATCH for the same root cause.
     discrepancies.push(
       mkDisc("CASH_MISMATCH", {
         account: "CASH",
-        expectedPaise: expectedCash.toString(),
+        expectedPaise: expectedCashFromKnownEvents.toString(),
         actualPaise: cashLedger.toString(),
-        diffPaise: (cashLedger - expectedCash).toString(),
-        detail: "CASH ledger balance does not match per-event cash flow aggregate",
+        diffPaise: (cashLedger - expectedCashFromKnownEvents).toString(),
+        detail: "CASH ledger balance does not match signed sum of INVOICE_PAID/PAYMENT_REVERSED/EXPENSE_RECORDED/INVOICE_VOIDED",
       })
     );
   }
-  // Additionally cross-check that the recognized expense outflows match
-  // the expenses table (any EXPENSE_RECORDED Cr CASH must have a
-  // corresponding expenses row).
+
+  // --- Cross-check: EXPENSES ---
   const expLedger = ledgerBalance.EXPENSES ?? BigInt(0);
   if (expLedger !== expenseTotal) {
     discrepancies.push(
@@ -441,24 +533,49 @@ async function sweepB(
     );
   }
 
-  // Revenue/tax parity (MEDIUM informational):
+  // --- 5. Revenue/Tax parity (MEDIUM) ---
   //
-  // For any correctly-posted ledger, the issuance-side AR activity
-  // (Dr AR from INVOICE_ISSUED net of Cr AR from INVOICE_VOIDED issuance
-  // reversals) must equal net Cr REVENUE + net Cr TAX_PAYABLE − net Dr
-  // DISCOUNT_CONTRA across those same issuance/void events.
+  // Across the ENTIRE ledger, net Dr ACCOUNTS_RECEIVABLE from ISUED/VOID
+  // (issuance reversals only, NOT payment legs) must equal net Cr REVENUE
+  // + net Cr TAX_PAYABLE − net Dr DISCOUNT_CONTRA.
   //
-  // We deliberately exclude INVOICE_PAID / PAYMENT_REVERSED / VOID-payment
-  // legs because they only move cash↔AR and never touch REVENUE/TAX;
-  // including them caused false positives whenever a refund/chargeback
-  // posted a PAYMENT_REVERSED (Dr AR, Cr CASH).
+  // Payment/reversal legs (INVOICE_PAID, PAYMENT_REVERSED, and the CASH
+  // reversal Dr AR leg we emit inside INVOICE_VOIDED when cash was
+  // received) move AR ↔ CASH and never touch REVENUE/TAX_PAYABLE. They
+  // are excluded from BOTH sides of this check so that void-after-
+  // partial-payment does not look like MEDIUM drift.
   //
-  // This drifts when an invoice is edited after issuance (ledger is
-  // append-only; to correct totals you must VOID+reissue), which is why
-  // it is MEDIUM rather than HIGH.
-  // Use string-literal IN list (Prisma.join does not mix well with enum
-  // columns in raw queries; the eventType values are hard-coded here and
-  // come from the ledger.ts builders, not from user input).
+  // We achieve this by filtering AR to only rows that are on ISUED/VOID
+  // events AND are part of the issuance set (REV/TAX/DISCOUNT/AR legs of
+  // ISUED, and the issuance-reversal CREDIT AR leg of VOID). The Dr AR
+  // cash-reversal leg inside INVOICE_VOIDED is emitted on the same
+  // INVOICE_VOIDED eventType, so we need an additional way to exclude
+  // it. We do so by recognizing that the cash-reversal leg has amount
+  // paidP and is part of a balanced event whose net AR contribution is
+  // (totalP - paidP) CREDIT — i.e., it appears opposite the expected
+  // issuance-side AR credit.
+  //
+  // Simpler robust approach: compute AR signed balance EXCLUDING the
+  // CASH-scoped event types (PAID/PAYMENT_REVERSED) AND EXCLUDING the
+  // cash-reversal leg of VOID. We identify the cash-reversal leg by
+  // grouping INVOICE_VOIDED AR rows by sign: the CREDIT leg at openArP
+  // (totalP - paidP) is the issuance reversal; the DEBIT leg at paidP
+  // is the cash-reversal. We net them via SUM but subtract the Dr
+  // component in-app. The cleanest SQL-side filter is to compute AR
+  // from ISUED/VOID only and then subtract any Dr AR from VOID that
+  // corresponds to a simultaneous CASH Cr of the same amount — but in
+  // practice, for our VOID builder, the non-issuance AR leg inside a
+  // VOID event is exactly the CASH reversal and equals paidP, which
+  // also equals the CASH Cr in the same event. Therefore we compute
+  // "issuance-only AR" as AR signed balance from ISUED+VOID MINUS the
+  // CASH reversal Dr (equal to |CASH Cr on VOID events|).
+  const issuanceInList = literalInList(["INVOICE_ISSUED", "INVOICE_VOIDED"]);
+  const issuanceAccounts = literalInList([
+    "ACCOUNTS_RECEIVABLE",
+    "REVENUE",
+    "TAX_PAYABLE",
+    "DISCOUNT_CONTRA",
+  ]);
   const issuanceRows = await tx.$queryRaw<
     Array<{ account: string; signed_balance: string }>
   >`
@@ -472,27 +589,51 @@ async function sweepB(
            ), 0)::text AS signed_balance
     FROM ledger_entries
     WHERE "userId" = ${tenantId}
-      AND "eventType" IN ('INVOICE_ISSUED'::"LedgerEventType", 'INVOICE_VOIDED'::"LedgerEventType")
-      AND account IN ('ACCOUNTS_RECEIVABLE'::"AccountType",
-                      'REVENUE'::"AccountType",
-                      'TAX_PAYABLE'::"AccountType",
-                      'DISCOUNT_CONTRA'::"AccountType")
+      AND "eventType" IN (${Prisma.raw(issuanceInList)})
+      AND account     IN (${Prisma.raw(issuanceAccounts)})
     GROUP BY account
   `;
   const iss: Record<string, bigint> = {};
   for (const r of issuanceRows) iss[r.account] = BigInt(r.signed_balance);
-  const issArDrMinusCr = iss.ACCOUNTS_RECEIVABLE ?? BigInt(0);            // should be ≥ 0 (Dr)
-  const issRevenueCr   = -(iss.REVENUE ?? BigInt(0));                     // -signed(Cr)
-  const issTaxCr       = -(iss.TAX_PAYABLE ?? BigInt(0));
-  const issDiscountDr  = iss.DISCOUNT_CONTRA ?? BigInt(0);                // Dr > 0
-  const expectedIssuedAr = issRevenueCr + issTaxCr - issDiscountDr;       // net issuance gross
+
+  // CASH Cr posted inside INVOICE_VOIDED events (payment-reversal legs).
+  // The offsetting Dr AR leg in those same events is cash movement, not
+  // issuance, and must be excluded from the AR side of the parity check
+  // to match.
+  const voidCashRows = await tx.$queryRaw<
+    Array<{ signed_balance: string }>
+  >`
+    SELECT COALESCE(SUM(
+             CASE
+               WHEN side = 'DEBIT'  THEN  "amountPaise"::numeric
+               WHEN side = 'CREDIT' THEN -"amountPaise"::numeric
+               ELSE 0
+             END
+           ), 0)::text AS signed_balance
+    FROM ledger_entries
+    WHERE "userId" = ${tenantId}
+      AND "eventType" = 'INVOICE_VOIDED'::"LedgerEventType"
+      AND account = 'CASH'
+  `;
+  // signed_balance of CASH on VOID events is ≤ 0 (Cr cash = refund) so
+  // the matching AR Dr leg = -signed_balance.
+  const voidCashSigned = BigInt(voidCashRows[0]?.signed_balance ?? "0");
+  // Issuance-only AR = AR from ISUED+VOID minus the cash-reversal Dr AR
+  // (which equals -voidCashSigned since voidCashSigned is negative).
+  const cashReversalArDr = voidCashSigned < BigInt(0) ? -voidCashSigned : BigInt(0);
+  const issArDrMinusCr = (iss.ACCOUNTS_RECEIVABLE ?? BigInt(0)) - cashReversalArDr;
+  const issRevenueCr = -(iss.REVENUE ?? BigInt(0));
+  const issTaxCr = -(iss.TAX_PAYABLE ?? BigInt(0));
+  const issDiscountDr = iss.DISCOUNT_CONTRA ?? BigInt(0);
+  const expectedIssuedAr = issRevenueCr + issTaxCr - issDiscountDr;
   if (issArDrMinusCr !== expectedIssuedAr) {
     discrepancies.push(
       mkDisc("REVENUE_TAX_MISMATCH", {
         expectedPaise: expectedIssuedAr.toString(),
         actualPaise: issArDrMinusCr.toString(),
         diffPaise: (issArDrMinusCr - expectedIssuedAr).toString(),
-        detail: "Issuance-side AR does not match Revenue+Tax−Discount (likely post-issuance invoice edits; void+reissue to correct)",
+        detail:
+          "Issuance-side AR does not match Revenue+Tax−Discount across INVOICE_ISSUED/INVOICE_VOIDED (likely post-issuance invoice edits; void+reissue to correct)",
       })
     );
   }
@@ -500,13 +641,12 @@ async function sweepB(
   return {
     discrepancies,
     expectedOpenReceivablePaise: openReceivable,
-    expectedPaidCashPaise: paidCash,
     expectedExpensePaise: expenseTotal,
   };
 }
 
 // ============================================================
-// TENANT LOCK (skip on contention)
+// TENANT LOCK (non-blocking; returns TRANSIENT_FAILURE on contention)
 // ============================================================
 
 async function tryAcquireTenantLock(
@@ -514,8 +654,9 @@ async function tryAcquireTenantLock(
   tenantId: string
 ): Promise<boolean> {
   const key = reconcileAdvisoryKeyFor(tenantId);
-  // pg_try_advisory_xact_lock returns true if lock acquired, false if
-  // another worker is already reconciling this tenant. Non-blocking.
+  // pg_try_advisory_xact_lock is non-blocking: returns true if acquired,
+  // false if another session holds it. We never queue behind another
+  // reconciler; the cron will simply retry on its next 15-min tick.
   const rows = await tx.$queryRawUnsafe<Array<{ acquired: boolean }>>(
     `SELECT pg_try_advisory_xact_lock(${key.toString()}) AS acquired`
   );
@@ -527,7 +668,7 @@ async function tryAcquireTenantLock(
 // ============================================================
 
 export interface ReconcileOptions {
-  /** Reconcile a single tenant (if omitted, all tenants). */
+  /** Reconcile a single tenant (omit for reconcileAllTenants bulk). */
   tenantId?: string;
   /** Ignore min-interval gating (force a run now). */
   force?: boolean;
@@ -535,15 +676,16 @@ export interface ReconcileOptions {
   batchSize?: number;
   /** Cap on tenants per run (incremental sweeps). */
   limit?: number;
-  /** Mode controls which tenants are selected. */
+  /** Mode controls which tenants are selected (used by reconcileAllTenants). */
   mode?: "incremental" | "full" | "single";
   /** Set true to skip auto-backfill (used by release/recheck paths). */
   skipAutoBackfill?: boolean;
   /**
-   * Set true to record audit results WITHOUT flipping the quarantine flag
-   * or firing alerts. Used immediately after a force-release so the
-   * confirmation run logs the remaining drift but does not re-quarantine
-   * the tenant the operator just explicitly cleared.
+   * When true, record the audit row + discrepancies but SKIP mutating
+   * users.ledgerQuarantinedAt and do not fire drift alerts. Used
+   * immediately after a force-release so the confirm run logs any
+   * residual drift without immediately re-quarantining the tenant the
+   * operator just explicitly cleared.
    */
   auditOnly?: boolean;
 }
@@ -565,40 +707,68 @@ export interface ReconcileResult {
 }
 
 function tally(ds: readonly Discrepancy[]) {
-  let c = 0, h = 0, m = 0, i = 0;
+  let c = 0,
+    h = 0,
+    m = 0,
+    i = 0;
   for (const d of ds) {
     switch (d.severity) {
-      case "CRITICAL": c++; break;
-      case "HIGH":     h++; break;
-      case "MEDIUM":   m++; break;
-      case "INFO":     i++; break;
+      case "CRITICAL":
+        c++;
+        break;
+      case "HIGH":
+        h++;
+        break;
+      case "MEDIUM":
+        m++;
+        break;
+      case "INFO":
+        i++;
+        break;
     }
   }
   return { critical: c, high: h, medium: m, info: i };
 }
 
-function statusFrom(
-  ds: readonly Discrepancy[],
-  hasCritical: boolean
-): ReconciliationStatus {
+function statusFrom(ds: readonly Discrepancy[]): ReconciliationStatus {
   if (ds.length === 0) return "PASSED";
-  if (hasCritical || ds.some((d) => d.severity === "CRITICAL")) return "HASH_BROKEN";
+  if (ds.some((d) => d.severity === "CRITICAL")) return "HASH_BROKEN";
   return "DRIFT_DETECTED";
 }
 
-/**
- * Reconcile a single tenant. Runs under withService("maint:reconcile") so
- * it can read cross-tenant ledger entries. Writes an audit row; flips
- * quarantine on CRITICAL/HIGH; performs auto-backfill once for AR/CASH/
- * EXPENSE mismatches.
- */
+/** Whitelist for tenant IDs before interpolation into SET LOCAL. */
 const SAFE_TENANT_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
+function escapeLiteral(s: string): string {
+  return s.replace(/'/g, "''").replace(/\\/g, "\\\\");
+}
+
+/**
+ * Reconcile a single tenant. Runs under withService("maint:reconcile")
+ * so it can read cross-tenant ledger entries for discovery, then
+ * SET LOCAL app.current_user_id = userId inside the tx so the RLS
+ * WITH CHECK policies permit updating that user's quarantine flags.
+ *
+ * Auto-backfill: for AR/CASH/EXPENSE mismatches without CRITICAL
+ * structural damage, we invoke backfillLedgerForSingleTenant(userId, tx)
+ * INSIDE this tx (so REPEATABLE READ snapshot sees the new rows) and
+ * re-run Sweep A+B once. HIGH remaining → quarantine.
+ */
 export async function reconcileTenant(
   tenantId: string,
   opts: Omit<ReconcileOptions, "tenantId" | "mode"> = {}
 ): Promise<ReconcileResult> {
   ensureDefaultDriftAlertHook();
+  // Read-Only DR / Maintenance mode: short-circuit BEFORE opening any
+  // service transaction, BEFORE acquiring the advisory lock, and BEFORE
+  // writing any audit rows / mutating quarantine flags / running the
+  // auto-backfill self-healing path. Throwing a typed ReadOnlyModeError
+  // lets Server Actions surface the friendly maintenance banner via the
+  // existing {ok:false,error:...} Sonner toast path, and lets cron
+  // callers (which wrap reconcileAllTenants) log and move on.
+  if (isReadOnlyMode()) {
+    throw new ReadOnlyModeError("reconciler:reconcileTenant");
+  }
   if (!SAFE_TENANT_RE.test(tenantId)) {
     throw new Error(`reconcileTenant: unsafe tenantId`);
   }
@@ -607,28 +777,35 @@ export async function reconcileTenant(
   const wid = workerId();
 
   return withService(RECONCILER_SERVICE, async (tx) => {
-    // We need to SET app.current_user_id for the duration of this tx
-    // so writes to the users table (quarantine flag / lastReconciledAt)
-    // satisfy the RLS WITH CHECK (id = current_user_id). The service
-    // role still only writes to the scoped tenant (we use this same
-    // userId in every .update where clause).
+    // SET LOCAL app.current_user_id so RLS WITH CHECK on users permits
+    // the quarantine flip / lastReconciledAt update for this tenant.
+    // Tenant is validated by SAFE_TENANT_RE above; still escape for
+    // defense-in-depth.
     await tx.$executeRawUnsafe(
-      `SET LOCAL app.current_user_id = '${tenantId}'`
+      `SET LOCAL app.current_user_id = '${escapeLiteral(tenantId)}'`
     );
 
-    // Per-tenant non-blocking advisory lock — if another worker is
-    // already reconciling this tenant, skip rather than queue.
+    // Non-blocking per-tenant advisory lock; never queue.
     const acquired = await tryAcquireTenantLock(tx, tenantId);
     if (!acquired) {
-      // Still record a TRANSIENT_FAILURE audit row so the operator sees it.
       const audit = await tx.reconciliationAudit.create({
         data: {
           tenantId,
           status: "TRANSIENT_FAILURE",
           durationMs: Date.now() - started,
           entriesScanned: 0,
-          discrepancies: [{ kind: "TRANSIENT_ERROR", severity: "INFO", detail: "Another reconcile run already in progress (advisory lock held)" }] as unknown as Prisma.InputJsonValue,
-          criticalCount: 0, highCount: 0, mediumCount: 0, infoCount: 1,
+          discrepancies: [
+            {
+              kind: "TRANSIENT_ERROR",
+              severity: "INFO",
+              detail:
+                "Another reconcile run already in progress (advisory lock held); skipping.",
+            },
+          ] as unknown as Prisma.InputJsonValue,
+          criticalCount: 0,
+          highCount: 0,
+          mediumCount: 0,
+          infoCount: 1,
           triggeredAlert: false,
           workerId: wid,
           version: RECONCILER_VERSION,
@@ -643,25 +820,28 @@ export async function reconcileTenant(
         entriesScanned: 0,
         firstBrokenIndex: null,
         discrepancies: [],
-        criticalCount: 0, highCount: 0, mediumCount: 0, infoCount: 1,
+        criticalCount: 0,
+        highCount: 0,
+        mediumCount: 0,
+        infoCount: 1,
         quarantined: false,
         autoRemediated: false,
         auditId: audit.id,
       };
     }
 
-    // Load tenant.
+    // Load tenant row.
     const user = await tx.user.findUnique({
       where: { id: tenantId },
       select: {
-        id: true, email: true,
+        id: true,
+        email: true,
         lastLedgerEntryHash: true,
         ledgerQuarantinedAt: true,
         ledgerQuarantineReason: true,
       },
     });
     if (!user) {
-      // Tenant doesn't exist; record PASSED with 0 entries.
       const audit = await tx.reconciliationAudit.create({
         data: {
           tenantId,
@@ -669,7 +849,10 @@ export async function reconcileTenant(
           durationMs: Date.now() - started,
           entriesScanned: 0,
           discrepancies: [] as unknown as Prisma.InputJsonValue,
-          criticalCount: 0, highCount: 0, mediumCount: 0, infoCount: 0,
+          criticalCount: 0,
+          highCount: 0,
+          mediumCount: 0,
+          infoCount: 0,
           triggeredAlert: false,
           workerId: wid,
           version: RECONCILER_VERSION,
@@ -678,13 +861,23 @@ export async function reconcileTenant(
         select: { id: true },
       });
       return {
-        tenantId, status: "PASSED", durationMs: Date.now() - started,
-        entriesScanned: 0, firstBrokenIndex: null, discrepancies: [],
-        criticalCount: 0, highCount: 0, mediumCount: 0, infoCount: 0,
-        quarantined: false, autoRemediated: false, auditId: audit.id,
+        tenantId,
+        status: "PASSED",
+        durationMs: Date.now() - started,
+        entriesScanned: 0,
+        firstBrokenIndex: null,
+        discrepancies: [],
+        criticalCount: 0,
+        highCount: 0,
+        mediumCount: 0,
+        infoCount: 0,
+        quarantined: false,
+        autoRemediated: false,
+        auditId: audit.id,
       };
     }
 
+    // --- Sweep A + Sweep B ---
     let sweepARes: SweepAResult;
     let sweepBRes: SweepBResult;
     try {
@@ -692,71 +885,106 @@ export async function reconcileTenant(
       sweepBRes = await sweepB(tx, tenantId, sweepARes);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      const dis: Discrepancy[] = [mkDisc("TRANSIENT_ERROR", { detail: `verifier threw: ${msg.slice(0, 400)}` })];
+      const dis: Discrepancy[] = [
+        mkDisc("TRANSIENT_ERROR", {
+          detail: `verifier threw: ${msg.slice(0, 400)}`,
+        }),
+      ];
       const t = tally(dis);
       const audit = await tx.reconciliationAudit.create({
         data: {
-          tenantId, status: "TRANSIENT_FAILURE",
-          durationMs: Date.now() - started, entriesScanned: 0,
+          tenantId,
+          status: "TRANSIENT_FAILURE",
+          durationMs: Date.now() - started,
+          entriesScanned: 0,
           discrepancies: dis as unknown as Prisma.InputJsonValue,
-          criticalCount: t.critical, highCount: t.high, mediumCount: t.medium, infoCount: t.info,
-          triggeredAlert: false, workerId: wid, version: RECONCILER_VERSION,
+          criticalCount: t.critical,
+          highCount: t.high,
+          mediumCount: t.medium,
+          infoCount: t.info,
+          triggeredAlert: false,
+          workerId: wid,
+          version: RECONCILER_VERSION,
           finishedAt: new Date(),
         },
         select: { id: true },
       });
       return {
-        tenantId, status: "TRANSIENT_FAILURE", durationMs: Date.now() - started,
-        entriesScanned: 0, firstBrokenIndex: null, discrepancies: dis,
-        criticalCount: t.critical, highCount: t.high, mediumCount: t.medium, infoCount: t.info,
-        quarantined: false, autoRemediated: false, auditId: audit.id,
+        tenantId,
+        status: "TRANSIENT_FAILURE",
+        durationMs: Date.now() - started,
+        entriesScanned: 0,
+        firstBrokenIndex: null,
+        discrepancies: dis,
+        criticalCount: t.critical,
+        highCount: t.high,
+        mediumCount: t.medium,
+        infoCount: t.info,
+        quarantined: false,
+        autoRemediated: false,
+        auditId: audit.id,
       };
     }
 
-    // Tail-pointer check.
+    // --- Tail-pointer check ---
     if (sweepARes.scanned === 0) {
       if (user.lastLedgerEntryHash != null) {
         sweepARes.discrepancies.push(
           mkDisc("TAIL_POINTER_DESYNC", {
-            detail: `user.lastLedgerEntryHash is set (${user.lastLedgerEntryHash.slice(0, 12)}…) but no ledger rows exist`,
+            detail: `user.lastLedgerEntryHash is set (${user.lastLedgerEntryHash.slice(
+              0,
+              12
+            )}…) but no ledger rows exist for tenant`,
           })
         );
-        if (!sweepARes.firstBrokenIndex) sweepARes.firstBrokenIndex = 0;
+        if (sweepARes.firstBrokenIndex === null) sweepARes.firstBrokenIndex = 0;
       }
     } else if (sweepARes.tailHash !== user.lastLedgerEntryHash) {
       sweepARes.discrepancies.push(
         mkDisc("TAIL_POINTER_DESYNC", {
-          detail: `user.lastLedgerEntryHash (${(user.lastLedgerEntryHash ?? "").slice(0, 12)}…) does not match actual tail (${(sweepARes.tailHash ?? "").slice(0, 12)}… at index ${sweepARes.tailIndex})`,
+          detail: `user.lastLedgerEntryHash (${(
+            user.lastLedgerEntryHash ?? ""
+          ).slice(0, 12)}…) does not match actual tail (${(
+            sweepARes.tailHash ?? ""
+          ).slice(0, 12)}… at index ${sweepARes.tailIndex})`,
         })
       );
-      if (!sweepARes.firstBrokenIndex) sweepARes.firstBrokenIndex = sweepARes.tailIndex;
+      if (sweepARes.firstBrokenIndex === null)
+        sweepARes.firstBrokenIndex = sweepARes.tailIndex;
     }
 
-    // Combine discrepancies.
-    let discrepancies: Discrepancy[] = [...sweepARes.discrepancies, ...sweepBRes.discrepancies];
+    // --- Combine discrepancies ---
+    let discrepancies: Discrepancy[] = [
+      ...sweepARes.discrepancies,
+      ...sweepBRes.discrepancies,
+    ];
     let autoRemediated = false;
     let autoRemediation: string | null = null;
 
-    // Auto-backfill once for HIGH mismatches that are backfill-fixable
-    // (AR/CASH/EXPENSE) when there are NO critical hash-chain failures.
+    // --- Auto-backfill (one attempt) for HIGH structural mismatches
+    //     when there are NO critical hash/balance/gap failures.
+    //     Backfill runs INSIDE this tx so the re-read Sweep A+B sees
+    //     the new rows under REPEATABLE READ snapshot isolation.
     const hasCriticalStructural = discrepancies.some(
-      (d) =>
-        d.severity === "CRITICAL" ||
-        d.kind === "ENTRY_INDEX_GAP"
+      (d) => d.severity === "CRITICAL"
     );
     const hasBackfillable = discrepancies.some(
-      (d) => d.kind === "AR_MISMATCH" || d.kind === "CASH_MISMATCH" || d.kind === "EXPENSE_MISMATCH"
+      (d) =>
+        d.kind === "AR_MISMATCH" ||
+        d.kind === "CASH_MISMATCH" ||
+        d.kind === "EXPENSE_MISMATCH"
     );
-    if (hasBackfillable && !hasCriticalStructural && !opts.skipAutoBackfill) {
+    if (
+      hasBackfillable &&
+      !hasCriticalStructural &&
+      !opts.skipAutoBackfill
+    ) {
       try {
-        // Backfill INSIDE this service tx so the subsequent Sweep A+B
-        // re-reads can see the newly appended rows (REPEATABLE READ
-        // would otherwise hide rows committed on a different connection).
         await backfillLedgerForSingleTenant(tenantId, tx);
-        // Re-run Sweep A+B against the updated state.
+        // Re-run Sweep A+B against the post-backfill state.
         const sa2 = await sweepA(tx, tenantId, batchSize);
         const sb2 = await sweepB(tx, tenantId, sa2);
-        // Re-check tail.
+        // Re-check tail pointer after backfill.
         const userAfter = await tx.user.findUnique({
           where: { id: tenantId },
           select: { lastLedgerEntryHash: true },
@@ -764,7 +992,12 @@ export async function reconcileTenant(
         if (sa2.tailHash !== userAfter?.lastLedgerEntryHash) {
           sa2.discrepancies.push(
             mkDisc("TAIL_POINTER_DESYNC", {
-              detail: `post-backfill tail mismatch (tail=${(sa2.tailHash ?? "").slice(0, 12)}… user=${(userAfter?.lastLedgerEntryHash ?? "").slice(0, 12)}…)`,
+              detail: `post-backfill tail mismatch (tail=${(
+                sa2.tailHash ?? ""
+              ).slice(0, 12)}… user=${(userAfter?.lastLedgerEntryHash ?? "").slice(
+                0,
+                12
+              )}…)`,
             })
           );
         }
@@ -776,20 +1009,24 @@ export async function reconcileTenant(
           sweepARes = sa2;
         }
       } catch (err) {
-        // Backfill failed — leave the original discrepancies; add an INFO.
         const msg = err instanceof Error ? err.message : String(err);
         discrepancies.push(
-          mkDisc("TRANSIENT_ERROR", { detail: `auto-backfill failed: ${msg.slice(0, 200)}` })
+          mkDisc("TRANSIENT_ERROR", {
+            detail: `auto-backfill failed: ${msg.slice(0, 200)}`,
+          })
         );
       }
     }
 
     const t = tally(discrepancies);
-    const status: ReconciliationStatus = statusFrom(discrepancies, t.critical > 0);
+    const status: ReconciliationStatus = statusFrom(discrepancies);
 
-    // Quarantine decision: CRITICAL → yes; HIGH → yes. MEDIUM/INFO → no.
-    // Skipped entirely when `auditOnly` is set (post-force-release confirm run).
-    const shouldQuarantine = (t.critical > 0 || t.high > 0) && !opts.auditOnly;
+    // --- Quarantine decision ---
+    // CRITICAL or remaining HIGH → quarantine. auditOnly mode SKIPS the
+    // quarantine flip (and skips lastReconciledAt update and alerts) so
+    // post-force-release confirm runs don't immediately re-quarantine.
+    const shouldQuarantine =
+      (t.critical > 0 || t.high > 0) && !opts.auditOnly;
     const alreadyQuarantined = !!user.ledgerQuarantinedAt;
     let quarantined = false;
     if (shouldQuarantine && !alreadyQuarantined) {
@@ -807,7 +1044,6 @@ export async function reconcileTenant(
       quarantined = true;
     }
 
-    // Always update lastReconciledAt (skipped in audit-only confirm runs).
     if (!opts.auditOnly) {
       await tx.user.update({
         where: { id: tenantId },
@@ -815,13 +1051,19 @@ export async function reconcileTenant(
       });
     }
 
-    // Create audit row.
+    // --- Audit row + alerting ---
     const dur = Date.now() - started;
     let triggeredAlert = false;
-    // Audit-only confirm runs do not fire alerts (operator already knows).
-    if (!opts.auditOnly && (t.critical > 0 || t.high > 0 || quarantined || autoRemediated || t.info > 0)) {
-      // Cooldown is queried against the in-tx client via AuditFindCapable;
-      // structural typing accepts any Prisma client or tx.
+    if (
+      !opts.auditOnly &&
+      (t.critical > 0 ||
+        t.high > 0 ||
+        quarantined ||
+        autoRemediated ||
+        t.info > 0)
+    ) {
+      // fireDriftAlerts accepts any Prisma-like client (structural typing);
+      // pass our in-tx client for cooldown lookups.
       type AuditClient = Parameters<typeof fireDriftAlerts>[1];
       triggeredAlert = await fireDriftAlerts(
         {
@@ -880,45 +1122,58 @@ export async function reconcileTenant(
 }
 
 /**
- * Run backfillLedger but scoped to a single tenant (we don't want to
- * re-scan every tenant during a per-tenant reconcile). This is a small
- * shim that does the same discovery the full backfill does, filtered
- * to one tenant.
+ * Idempotent backfill for a single tenant. Appends INVOICE_ISSUED /
+ * INVOICE_PAID / INVOICE_VOIDED / EXPENSE_RECORDED entries for any
+ * invoices/expenses that don't already have a corresponding ledger row.
+ *
+ * Accepts an optional tx (used by reconcileTenant's in-tx auto-backfill);
+ * when provided, all posts join that transaction so the caller's
+ * REPEATABLE READ snapshot can see the new rows.
  */
 export async function backfillLedgerForSingleTenant(
   tenantId: string,
   tx?: Prisma.TransactionClient
-): Promise<{
-  invoices: number;
-  expenses: number;
-}> {
-  // We import the single-event post function lazily to avoid cycles.
+): Promise<{ invoices: number; expenses: number }> {
+  // Lazy import to avoid a cycle (ledger → tenant → … → reconciler).
   const { postLedgerEvent } = await import("@/lib/ledger");
-  // When running inside an outer reconciler tx we pass `tx` down so the
-  // new ledger rows join the same transaction and subsequent in-tx
-  // Sweep A+B calls can see them (without this, REPEATABLE READ means
-  // the outer tx would keep its snapshot and miss backfilled rows).
-  const runIn = tx;
   const prismaClient = tx ?? prisma;
   let invoicesCount = 0;
   let expensesCount = 0;
 
-  // ---- Invoices ----
+  // --- Invoices ---
   const issued = await prismaClient.ledgerEntry.findMany({
-    where: { userId: tenantId, eventType: "INVOICE_ISSUED", invoiceId: { not: null } },
+    where: {
+      userId: tenantId,
+      eventType: "INVOICE_ISSUED",
+      invoiceId: { not: null },
+    },
     select: { invoiceId: true },
   });
   const paid = await prismaClient.ledgerEntry.findMany({
-    where: { userId: tenantId, eventType: "INVOICE_PAID", invoiceId: { not: null } },
+    where: {
+      userId: tenantId,
+      eventType: "INVOICE_PAID",
+      invoiceId: { not: null },
+    },
     select: { invoiceId: true },
   });
   const voided = await prismaClient.ledgerEntry.findMany({
-    where: { userId: tenantId, eventType: "INVOICE_VOIDED", invoiceId: { not: null } },
+    where: {
+      userId: tenantId,
+      eventType: "INVOICE_VOIDED",
+      invoiceId: { not: null },
+    },
     select: { invoiceId: true },
   });
-  const alreadyIssued = new Set(issued.map((r) => r.invoiceId).filter(Boolean) as string[]);
-  const alreadyPaid = new Set(paid.map((r) => r.invoiceId).filter(Boolean) as string[]);
-  const alreadyVoided = new Set(voided.map((r) => r.invoiceId).filter(Boolean) as string[]);
+  const alreadyIssued = new Set(
+    issued.map((r) => r.invoiceId).filter((v): v is string => v !== null)
+  );
+  const alreadyPaid = new Set(
+    paid.map((r) => r.invoiceId).filter((v): v is string => v !== null)
+  );
+  const alreadyVoided = new Set(
+    voided.map((r) => r.invoiceId).filter((v): v is string => v !== null)
+  );
 
   const invoices = await prismaClient.invoice.findMany({
     where: { userId: tenantId, status: { not: "DRAFT" } },
@@ -936,22 +1191,27 @@ export async function backfillLedgerForSingleTenant(
       items,
       taxRate: Number(inv.taxRate),
       discountType: inv.discountType,
-      discountValue: inv.discountValue != null ? Number(inv.discountValue) : null,
+      discountValue:
+        inv.discountValue != null ? Number(inv.discountValue) : null,
     } as const;
 
     let posted = false;
     if (!alreadyIssued.has(inv.id)) {
-      await postLedgerEvent({ type: "INVOICE_ISSUED", invoice: invoiceDraft }, runIn);
+      await postLedgerEvent({ type: "INVOICE_ISSUED", invoice: invoiceDraft }, tx);
       posted = true;
     }
     if (inv.status === "PAID" && !alreadyPaid.has(inv.id)) {
       await postLedgerEvent(
         {
           type: "INVOICE_PAID",
-          invoice: { id: inv.id, userId: inv.userId, totalAmount: inv.totalAmount },
+          invoice: {
+            id: inv.id,
+            userId: inv.userId,
+            totalAmount: inv.totalAmount,
+          },
           amountPaid: inv.totalAmount,
         },
-        runIn
+        tx
       );
       posted = true;
     } else if (inv.status === "VOID" && !alreadyVoided.has(inv.id)) {
@@ -960,29 +1220,43 @@ export async function backfillLedgerForSingleTenant(
           type: "INVOICE_VOIDED",
           invoice: { ...invoiceDraft, paidAmount: null },
         },
-        runIn
+        tx
       );
       posted = true;
     }
     if (posted) invoicesCount++;
   }
 
-  // ---- Expenses ----
+  // --- Expenses ---
   const expensed = await prismaClient.ledgerEntry.findMany({
-    where: { userId: tenantId, eventType: "EXPENSE_RECORDED", expenseId: { not: null } },
+    where: {
+      userId: tenantId,
+      eventType: "EXPENSE_RECORDED",
+      expenseId: { not: null },
+    },
     select: { expenseId: true },
   });
-  const alreadyExpensed = new Set(expensed.map((r) => r.expenseId).filter(Boolean) as string[]);
+  const alreadyExpensed = new Set(
+    expensed.map((r) => r.expenseId).filter((v): v is string => v !== null)
+  );
   const expenses = await prismaClient.expense.findMany({
-    where: { userId: tenantId, NOT: { id: { in: Array.from(alreadyExpensed) } } },
+    where: {
+      userId: tenantId,
+      NOT: { id: { in: Array.from(alreadyExpensed) } },
+    },
   });
   for (const exp of expenses) {
     await postLedgerEvent(
       {
         type: "EXPENSE_RECORDED",
-        expense: { id: exp.id, userId: exp.userId, amount: exp.amount, category: exp.category },
+        expense: {
+          id: exp.id,
+          userId: exp.userId,
+          amount: exp.amount,
+          category: exp.category,
+        },
       },
-      runIn
+      tx
     );
     expensesCount++;
   }
@@ -991,17 +1265,30 @@ export async function backfillLedgerForSingleTenant(
 }
 
 /**
- * Reconcile many tenants. `mode` controls which tenants are selected:
- *   - "full":        every user (no filter).
- *   - "incremental": users where lastReconciledAt is null OR > 15m old
- *                    OR lastLedgerEntryHash was updated recently (we
- *                    approximate: lastReconciledAt < now - 15m).
- *   - "single":      single tenant (use reconcileTenant() directly).
+ * Reconcile many tenants.
+ *   - "full":        every non-DRAFT user (no filter).
+ *   - "incremental": users where lastReconciledAt is null OR > 15 min old
+ *                    OR currently quarantined (so operators see fresh
+ *                    audit history during incident response).
+ *   - "single":      use reconcileTenant() directly.
+ *
+ * Errors on a single tenant do not abort the batch; a TRANSIENT_FAILURE
+ * audit row is written via the service path so the operator sees it.
  */
 export async function reconcileAllTenants(
   opts: ReconcileOptions = {}
 ): Promise<ReconcileResult[]> {
   ensureDefaultDriftAlertHook();
+  // Read-Only DR / Maintenance mode: skip the bulk sweep entirely.
+  // Returning [] (no per-tenant TRANSIENT_FAILURE rows) avoids any DB
+  // writes (reconciliation_audits INSERTs, lastReconciledAt updates,
+  // quarantine flips) while keeping the cron route response well-formed.
+  if (isReadOnlyMode()) {
+    console.error(
+      "[reconciler] SMARTBILL_READ_ONLY active — skipping reconcileAllTenants (no mutations, no audits written)."
+    );
+    return [];
+  }
   const mode = opts.mode ?? "incremental";
   const limit = opts.limit ?? (mode === "full" ? 1000 : 20);
 
@@ -1012,8 +1299,8 @@ export async function reconcileAllTenants(
       OR: [
         { lastReconciledAt: null },
         { lastReconciledAt: { lt: fifteenMinAgo } },
-        // Quarantined tenants are re-checked every run so the operator
-        // can see audit history even if they haven't been released.
+        // Always re-scan quarantined tenants so the audit log is fresh
+        // while an operator is investigating.
         { ledgerQuarantinedAt: { not: null } },
       ],
     };
@@ -1033,14 +1320,17 @@ export async function reconcileAllTenants(
         batchSize: opts.batchSize ?? DEFAULT_BATCH,
         force: opts.force,
         skipAutoBackfill: opts.skipAutoBackfill,
+        auditOnly: opts.auditOnly,
       });
       results.push(r);
     } catch (err) {
       console.error("[reconciler] tenant", u.id, "failed:", err);
-      // Record a TRANSIENT_FAILURE audit via service path.
       try {
         const wid = workerId();
         await withService(RECONCILER_SERVICE, async (tx) => {
+          await tx.$executeRawUnsafe(
+            `SET LOCAL app.current_user_id = '${escapeLiteral(u.id)}'`
+          );
           await tx.reconciliationAudit.create({
             data: {
               tenantId: u.id,
@@ -1053,40 +1343,53 @@ export async function reconcileAllTenants(
                   severity: "INFO",
                   detail:
                     "reconcileAllTenants worker error: " +
-                    (err instanceof Error ? err.message.slice(0, 300) : String(err).slice(0, 300)),
+                    (err instanceof Error
+                      ? err.message.slice(0, 300)
+                      : String(err).slice(0, 300)),
                 },
               ] as unknown as Prisma.InputJsonValue,
-              criticalCount: 0, highCount: 0, mediumCount: 0, infoCount: 1,
-              triggeredAlert: false, workerId: wid, version: RECONCILER_VERSION,
+              criticalCount: 0,
+              highCount: 0,
+              mediumCount: 0,
+              infoCount: 1,
+              triggeredAlert: false,
+              workerId: wid,
+              version: RECONCILER_VERSION,
               finishedAt: new Date(),
             },
           });
         });
       } catch {
-        // swallow — we already logged.
+        // Swallow — we already logged the primary error.
       }
     }
   }
   return results;
 }
 
-/**
- * Operator-only helpers: manual quarantine, release with re-verify,
- * backfill. These are used by admin routes.
- */
+// ============================================================
+// OPERATOR HELPERS (manual quarantine / release / backfill)
+// ============================================================
+
 export async function quarantineTenant(
   tenantId: string,
   reason: string,
   actor: string
 ): Promise<void> {
-  if (!SAFE_TENANT_RE.test(tenantId)) throw new Error("quarantineTenant: unsafe tenantId");
+  if (!SAFE_TENANT_RE.test(tenantId))
+    throw new Error("quarantineTenant: unsafe tenantId");
   await withService(RECONCILER_SERVICE, async (tx) => {
-    await tx.$executeRawUnsafe(`SET LOCAL app.current_user_id = '${tenantId}'`);
+    await tx.$executeRawUnsafe(
+      `SET LOCAL app.current_user_id = '${escapeLiteral(tenantId)}'`
+    );
     await tx.user.update({
       where: { id: tenantId },
       data: {
         ledgerQuarantinedAt: new Date(),
-        ledgerQuarantineReason: `MANUAL:${reason.slice(0, 200)} (by ${actor.slice(0, 64)})`,
+        ledgerQuarantineReason: `MANUAL:${reason.slice(0, 200)} (by ${actor.slice(
+          0,
+          64
+        )})`,
       },
     });
     await tx.reconciliationAudit.create({
@@ -1095,9 +1398,20 @@ export async function quarantineTenant(
         status: "DRIFT_DETECTED",
         durationMs: 0,
         entriesScanned: 0,
-        discrepancies: [{ kind: "AR_MISMATCH", severity: "HIGH", detail: `Manual quarantine: ${reason.slice(0, 300)}` }] as unknown as Prisma.InputJsonValue,
-        criticalCount: 0, highCount: 1, mediumCount: 0, infoCount: 0,
-        triggeredAlert: false, workerId: workerId(), version: RECONCILER_VERSION,
+        discrepancies: [
+          {
+            kind: "AR_MISMATCH",
+            severity: "HIGH",
+            detail: `Manual quarantine: ${reason.slice(0, 300)}`,
+          },
+        ] as unknown as Prisma.InputJsonValue,
+        criticalCount: 0,
+        highCount: 1,
+        mediumCount: 0,
+        infoCount: 0,
+        triggeredAlert: false,
+        workerId: workerId(),
+        version: RECONCILER_VERSION,
         finishedAt: new Date(),
       },
     });
@@ -1109,8 +1423,10 @@ export async function releaseQuarantine(
   reason: string,
   opts: { force?: boolean } = {}
 ): Promise<{ ok: boolean; result?: ReconcileResult; error?: string }> {
-  if (!SAFE_TENANT_RE.test(tenantId)) throw new Error("releaseQuarantine: unsafe tenantId");
-  // Release requires a fresh reconcile pass (unless force).
+  if (!SAFE_TENANT_RE.test(tenantId))
+    throw new Error("releaseQuarantine: unsafe tenantId");
+
+  // Non-force release requires a clean reconcile first.
   if (!opts.force) {
     const result = await reconcileTenant(tenantId, { skipAutoBackfill: false });
     if (result.status !== "PASSED") {
@@ -1121,8 +1437,11 @@ export async function releaseQuarantine(
       };
     }
   }
+
   await withService(RECONCILER_SERVICE, async (tx) => {
-    await tx.$executeRawUnsafe(`SET LOCAL app.current_user_id = '${tenantId}'`);
+    await tx.$executeRawUnsafe(
+      `SET LOCAL app.current_user_id = '${escapeLiteral(tenantId)}'`
+    );
     await tx.user.update({
       where: { id: tenantId },
       data: { ledgerQuarantinedAt: null, ledgerQuarantineReason: null },
@@ -1133,21 +1452,33 @@ export async function releaseQuarantine(
         status: "PASSED",
         durationMs: 0,
         entriesScanned: 0,
-        discrepancies: [{
-          kind: "TRANSIENT_ERROR", severity: "INFO",
-          detail: `Quarantine released${opts.force ? " (force)" : ""}: ${reason.slice(0, 300)}`,
-        }] as unknown as Prisma.InputJsonValue,
-        criticalCount: 0, highCount: 0, mediumCount: 0, infoCount: 1,
-        triggeredAlert: false, workerId: workerId(), version: RECONCILER_VERSION,
+        discrepancies: [
+          {
+            kind: "TRANSIENT_ERROR",
+            severity: "INFO",
+            detail: `Quarantine released${opts.force ? " (force)" : ""}: ${reason.slice(
+              0,
+              300
+            )}`,
+          },
+        ] as unknown as Prisma.InputJsonValue,
+        criticalCount: 0,
+        highCount: 0,
+        mediumCount: 0,
+        infoCount: 1,
+        triggeredAlert: false,
+        workerId: workerId(),
+        version: RECONCILER_VERSION,
         finishedAt: new Date(),
       },
     });
   });
+
   // Post-release confirmation run. On force-release the operator has
-  // explicitly accepted residual drift; run in auditOnly mode so this
-  // run records an audit row but does NOT re-quarantine or fire alerts.
+  // explicitly accepted residual drift — run in auditOnly mode so we
+  // record an audit row but DO NOT re-quarantine or fire alerts.
   const result = await reconcileTenant(tenantId, {
-    skipAutoBackfill: !opts.force, // try backfill once after a normal release
+    skipAutoBackfill: !opts.force,
     auditOnly: !!opts.force,
   });
   return { ok: true, result };
@@ -1158,8 +1489,8 @@ export async function operatorBackfill(tenantId: string): Promise<{
   expenses: number;
   result: ReconcileResult;
 }> {
-  // operatorBackfill is invoked from Server Actions outside any outer tx,
-  // so it's safe to use the global prisma (no tx argument).
+  // Invoked from Server Actions outside any outer tx — safe to use the
+  // global prisma (no tx arg); runs as service_role via reconcileTenant.
   const r = await backfillLedgerForSingleTenant(tenantId);
   const result = await reconcileTenant(tenantId, { skipAutoBackfill: true });
   return { invoices: r.invoices, expenses: r.expenses, result };

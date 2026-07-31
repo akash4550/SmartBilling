@@ -18,7 +18,7 @@ import { prisma } from "@/lib/prisma";
 import { withTenant } from "@/lib/tenant";
 import { logActivity } from "@/lib/activity";
 import { sendPaymentReceipt } from "@/lib/send-payment-receipt";
-import { postLedgerEvent } from "@/lib/ledger";
+import { postLedgerEvent, resolveCashPaidForInvoice } from "@/lib/ledger";
 import { toNumber } from "@/lib/money";
 import type { Invoice, Prisma } from "@prisma/client";
 
@@ -257,6 +257,15 @@ export async function voidInvoice(
     // Only post reversing ledger entries if the invoice had been issued
     // (PENDING/PAID). DRAFTs were never on the ledger.
     if (!wasDraft) {
+      // Resolve net cash posted for this invoice so we reverse exactly
+      // what was recorded — critical for partial-payment / chargeback
+      // scenarios where wasPaid=true but the actual CASH Dr is less than
+      // (or already partially reversed from) the invoice total. Passing
+      // the raw totalAmount would over-reverse and produce a false
+      // CASH_MISMATCH in Sweep B.
+      const netCashPaid = wasPaid
+        ? await resolveCashPaidForInvoice(updated.id, updated.userId, tx)
+        : BigInt(0);
       await postLedgerEvent(
         {
           type: "INVOICE_VOIDED",
@@ -271,7 +280,7 @@ export async function voidInvoice(
             taxRate: Number(pre.taxRate),
             discountType: pre.discountType,
             discountValue: pre.discountValue != null ? Number(pre.discountValue) : null,
-            paidAmount: wasPaid ? pre.totalAmount : null,
+            paidAmount: netCashPaid > BigInt(0) ? netCashPaid : null,
           },
         },
         tx

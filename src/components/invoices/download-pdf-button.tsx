@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import * as React from "react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Download, Loader2 } from "lucide-react";
@@ -25,6 +25,13 @@ interface DownloadPdfButtonProps {
  * because the request may need auth cookies (admin endpoint); a programmatic
  * fetch + blob-url click preserves the session and surfaces HTTP errors
  * (e.g. 401/404/429) as Sonner toasts instead of silent browser errors.
+ *
+ * Double-click / overlapping-request hardening:
+ *   - Synchronous DOM lock before await/setState.
+ *   - AbortController in a ref; a second click aborts the in-flight fetch
+ *     (and revokes its blob URL if it already resolved — very unlikely in
+ *     20ms, but covered defensively).
+ *   - AbortError filtered in catch().
  */
 export function DownloadPdfButton({
   invoiceId,
@@ -34,15 +41,35 @@ export function DownloadPdfButton({
   label = "Download PDF",
   className,
 }: DownloadPdfButtonProps) {
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = React.useState(false);
+  const buttonRef = React.useRef<HTMLButtonElement | null>(null);
+  const abortRef = React.useRef<AbortController | null>(null);
+  const lastBlobUrlRef = React.useRef<string | null>(null);
 
-  async function handleClick() {
+  React.useEffect(() => {
+    return () => {
+      if (abortRef.current) abortRef.current.abort();
+      if (lastBlobUrlRef.current) URL.revokeObjectURL(lastBlobUrlRef.current);
+    };
+  }, []);
+
+  async function handleClick(e: React.MouseEvent<HTMLButtonElement>) {
+    // ---- Synchronous DOM lock ----
+    const btn = e.currentTarget;
+    if (btn.disabled) return;
+    btn.disabled = true;
+
+    // ---- Abort any prior in-flight download ----
+    if (abortRef.current) abortRef.current.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     setLoading(true);
     try {
       const url = publicDownload
         ? `/api/public/invoices/${invoiceId}/pdf`
         : `/api/invoices/${invoiceId}/pdf`;
-      const res = await fetch(url, { cache: "no-store" });
+      const res = await fetch(url, { cache: "no-store", signal: controller.signal });
       if (!res.ok) {
         let msg = "Failed to download PDF";
         try {
@@ -71,18 +98,31 @@ export function DownloadPdfButton({
         if (simpleMatch && simpleMatch[1]) filename = simpleMatch[1];
       }
       const blob = await res.blob();
+      // If aborted after headers but during blob read, don't surface the file.
+      if (controller.signal.aborted) return;
       const blobUrl = URL.createObjectURL(blob);
+      // Revoke any stale blob URL from a prior aborted run.
+      if (lastBlobUrlRef.current) URL.revokeObjectURL(lastBlobUrlRef.current);
+      lastBlobUrlRef.current = blobUrl;
       const a = document.createElement("a");
       a.href = blobUrl;
       a.download = filename;
       document.body.appendChild(a);
       a.click();
       a.remove();
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 2000);
+      window.setTimeout(() => {
+        if (lastBlobUrlRef.current === blobUrl) {
+          URL.revokeObjectURL(blobUrl);
+          lastBlobUrlRef.current = null;
+        }
+      }, 2000);
       toast.success("PDF downloaded", { description: filename });
-    } catch {
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
       toast.error("Network error — please try again");
     } finally {
+      if (abortRef.current === controller) abortRef.current = null;
+      btn.disabled = false;
       setLoading(false);
     }
   }
@@ -90,6 +130,7 @@ export function DownloadPdfButton({
   return (
     <Button
       type="button"
+      ref={buttonRef}
       variant={variant}
       size={size}
       onClick={handleClick}

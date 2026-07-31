@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import * as React from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import { Ban, Loader2 } from "lucide-react";
@@ -34,16 +34,35 @@ export function VoidInvoiceButton({
   onVoided,
 }: VoidInvoiceButtonProps) {
   const router = useRouter();
-  const [open, setOpen] = useState(false);
-  const [submitting, setSubmitting] = useState(false);
+  const [open, setOpen] = React.useState(false);
+  const [submitting, setSubmitting] = React.useState(false);
+  const confirmBtnRef = React.useRef<HTMLButtonElement | null>(null);
+  const abortRef = React.useRef<AbortController | null>(null);
 
-  async function handleVoid() {
+  React.useEffect(() => {
+    return () => {
+      if (abortRef.current) abortRef.current.abort();
+    };
+  }, []);
+
+  async function handleVoid(e: React.MouseEvent<HTMLButtonElement>) {
+    // ---- Synchronous DOM lock (target: the confirm button) ----
+    const btn = e.currentTarget;
+    if (btn.disabled) return;
+    btn.disabled = true;
+
+    // ---- Abort any prior in-flight void ----
+    if (abortRef.current) abortRef.current.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     setSubmitting(true);
     try {
       const res = await fetch(`/api/invoices/${invoiceId}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ status: "VOID" }),
+        signal: controller.signal,
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
@@ -56,8 +75,12 @@ export function VoidInvoiceButton({
       onVoided?.();
       router.refresh();
     } catch (err) {
+      // ---- Silently swallow user-initiated aborts ----
+      if (err instanceof DOMException && err.name === "AbortError") return;
       toast.error(err instanceof Error ? err.message : "Failed to void invoice");
     } finally {
+      if (abortRef.current === controller) abortRef.current = null;
+      btn.disabled = false;
       setSubmitting(false);
     }
   }
@@ -83,7 +106,12 @@ export function VoidInvoiceButton({
           <Button variant="outline" onClick={() => setOpen(false)} disabled={submitting}>
             Cancel
           </Button>
-          <Button variant="destructive" onClick={handleVoid} disabled={submitting}>
+          <Button
+            ref={confirmBtnRef}
+            variant="destructive"
+            onClick={handleVoid}
+            disabled={submitting}
+          >
             {submitting && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
             Yes, void invoice
           </Button>

@@ -1,196 +1,119 @@
 /**
- * Pluggable sliding-window rate limiter.
+ * @deprecated Use `src/lib/rate-limiter.ts` instead.
  *
- * Two backends are shipped:
- *   1. "memory" (default in dev / single-instance deploys) — in-process Map.
- *   2. "upstash" (activated when UPSTASH_REDIS_REST_URL is set) — distributed
- *      sliding window over Upstash Redis, safe across Vercel Lambda replicas.
+ * Compatibility shim that re-exports the canonical rate-limiter under
+ * the old API shape. Synchronous `rateLimit()` continues to run a
+ * local in-process sliding window (matching pre-unification behavior);
+ * async callers get the full Upstash + memory-fallback pipeline via
+ * `rateLimitAsync()`.
  *
- * Callers import the pre-configured singleton `rateLimit()` and the
- * `requestKey()` helper from this file and use them exactly as before;
- * switching backends is a matter of setting (or unsetting) env vars.
- *
- * The Redis adapter uses a sorted-set TTLed key per bucket, which gives an
- * exact sliding-window count without requiring a dedicated cron job for
- * bucket expiration.
+ * Once every call site has been migrated to:
+ *     import { checkRateLimit, requestKey } from "@/lib/rate-limiter";
+ * this file and `rate-limit-redis.ts` can be deleted.
  */
 
-// ============================================================
-// TYPES
-// ============================================================
+import { NextResponse as NextResponseClass } from "next/server";
 
-export interface RateLimitConfig {
-  /** Unique namespace (isolates endpoints from one another). */
-  namespace: string;
-  /** Maximum requests per window. */
-  limit: number;
-  /** Window size in seconds. */
-  windowSec: number;
-}
+import {
+  checkRateLimit,
+  requestKey as _requestKey,
+  userKey as _userKey,
+  type RateLimitConfig as _Cfg,
+  type RateLimitResult as _Res,
+} from "./rate-limiter";
 
-export interface RateLimitResult {
-  allowed: boolean;
-  remaining: number;
-  /** Milliseconds until the oldest hit falls out of the window. */
-  retryAfterMs: number;
-}
+export type RateLimitConfig = _Cfg;
+export type RateLimitResult = _Res;
 
-export interface RateLimiter {
-  (key: string, cfg: RateLimitConfig): Promise<RateLimitResult> | RateLimitResult;
-}
+export const requestKey = _requestKey;
+export const userKey = _userKey;
 
-// ============================================================
-// MEMORY BACKEND
-// ============================================================
+// ---------------------------------------------------------------------------
+// Legacy synchronous in-memory backend (preserves pre-migration semantics)
+// ---------------------------------------------------------------------------
 
-interface Bucket {
+interface _Bucket {
   hits: number[];
+  windowMs: number;
+  limit: number;
 }
+const _buckets = new Map<string, _Bucket>();
 
-const memoryBuckets = new Map<string, Bucket>();
-
-function memoryRateLimit(key: string, cfg: RateLimitConfig): RateLimitResult {
+function _syncCheck(key: string, cfg: RateLimitConfig): _Res {
   const bucketKey = `${cfg.namespace}:${key}`;
   const now = Date.now();
   const windowMs = cfg.windowSec * 1000;
-
-  let bucket = memoryBuckets.get(bucketKey);
-  if (!bucket) {
-    bucket = { hits: [] };
-    memoryBuckets.set(bucketKey, bucket);
-  }
-
   const cutoff = now - windowMs;
-  while (bucket.hits.length && bucket.hits[0]! < cutoff) {
-    bucket.hits.shift();
-  }
 
-  if (bucket.hits.length >= cfg.limit) {
-    const oldest = bucket.hits[0] ?? now;
+  let b = _buckets.get(bucketKey);
+  if (!b || b.windowMs !== windowMs || b.limit !== cfg.limit) {
+    b = { hits: [], windowMs, limit: cfg.limit };
+    _buckets.set(bucketKey, b);
+  }
+  while (b.hits.length && b.hits[0]! < cutoff) b.hits.shift();
+
+  if (b.hits.length >= cfg.limit) {
+    const oldest = b.hits[0] ?? now;
     const retryAfterMs = Math.max(0, oldest + windowMs - now);
-    return { allowed: false, remaining: 0, retryAfterMs };
+    return {
+      allowed: false,
+      remaining: 0,
+      retryAfterMs,
+      toResponse: (msg = "Too many requests — please try again later.") => {
+        // Dynamic import is sync-unsafe at call time in CJS; we
+        // construct a plain Response instead so this works in both
+        // sync and async callers without pulling NextResponse into
+        // every module that imports the limiter.
+        const secs = Math.max(1, Math.ceil(retryAfterMs / 1000));
+        return new NextResponseClass(JSON.stringify({ error: msg }), {
+          status: 429,
+          headers: {
+            "Content-Type": "application/json",
+            "Retry-After": String(secs),
+          },
+        });
+      },
+    };
   }
-
-  bucket.hits.push(now);
+  b.hits.push(now);
   return {
     allowed: true,
-    remaining: cfg.limit - bucket.hits.length,
+    remaining: cfg.limit - b.hits.length,
     retryAfterMs: 0,
+    toResponse: () => {
+      throw new Error("toResponse() is only meaningful on rate-limited results");
+    },
   };
 }
 
-// Periodically GC expired memory buckets.
+// Periodic GC for the shim's memory buckets (mirrors old behavior).
 if (typeof setInterval !== "undefined") {
   const iv = setInterval(() => {
     const now = Date.now();
-    for (const [k, b] of memoryBuckets) {
-      if (
-        b.hits.length === 0 ||
-        b.hits[b.hits.length - 1]! < now - 60 * 60 * 1000
-      ) {
-        memoryBuckets.delete(k);
-      }
+    for (const [k, b] of _buckets) {
+      const newest = b.hits[b.hits.length - 1] ?? 0;
+      if (newest < now - Math.max(b.windowMs, 60 * 60 * 1000)) _buckets.delete(k);
     }
   }, 10 * 60 * 1000);
-  // Allow the process to exit cleanly even with the interval running.
-  if (typeof iv.unref === "function") iv.unref();
-}
-
-// ============================================================
-// FACTORY
-// ============================================================
-
-let _limiter: RateLimiter | undefined;
-
-/**
- * Select the rate-limit backend based on environment:
- *   - If UPSTASH_REDIS_REST_URL (and optionally UPSTASH_REDIS_REST_TOKEN)
- *     are set, use the Upstash Redis sliding-window adapter.
- *   - Otherwise fall back to the in-memory adapter.
- *
- * Redis connection failures automatically fall through to the in-memory
- * backend on a per-call basis so an outage never hard-fails protected
- * endpoints.
- */
-export async function getRateLimiter(): Promise<RateLimiter> {
-  if (_limiter) return _limiter;
-
-  const url = process.env.UPSTASH_REDIS_REST_URL;
-  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
-
-  if (url) {
-    try {
-      const { createUpstashRateLimiter } = await import("./rate-limit-redis");
-      const redisLimiter = createUpstashRateLimiter({ url, token: token ?? "" });
-      _limiter = async (key, cfg) => {
-        try {
-          return await redisLimiter(key, cfg);
-        } catch (err) {
-          console.error("[rate-limit] Redis backend failed; falling back to memory:", err);
-          return memoryRateLimit(key, cfg);
-        }
-      };
-      return _limiter;
-    } catch (err) {
-      console.error("[rate-limit] Failed to load Redis adapter; using memory:", err);
-    }
+  if (typeof (iv as NodeJS.Timeout).unref === "function") {
+    (iv as NodeJS.Timeout).unref();
   }
-
-  _limiter = memoryRateLimit;
-  return _limiter;
 }
 
 /**
- * Backwards-compatible synchronous wrapper. Uses the memory backend
- * synchronously if it's the selected one; otherwise falls back to memory
- * synchronously (Redis calls would require await). Callers that want the
- * Redis backend in production should `await rateLimitAsync()` instead.
- *
- * Because all existing callers are synchronous (they call `rateLimit()`
- * and immediately use the result), keeping this signature preserves zero
- * churn for call sites while still allowing new async callers.
+ * Legacy synchronous API. Matches pre-unification behavior exactly —
+ * only consults an in-memory Map, never the Upstash backend. New code
+ * should `await checkRateLimit(...)` from `@/lib/rate-limiter` to
+ * benefit from distributed limits.
  */
 export function rateLimit(key: string, cfg: RateLimitConfig): RateLimitResult {
-  return memoryRateLimit(key, cfg);
+  return _syncCheck(key, cfg);
 }
 
-/**
- * Async-aware rate-limit entry point. Uses the configured backend (Redis
- * or memory) and always returns a promise. New endpoints should prefer
- * this so distributed rate-limiting is effective out of the box.
- */
+/** Async-aware entry point — uses the full Upstash + memory pipeline. */
 export async function rateLimitAsync(
   key: string,
   cfg: RateLimitConfig
 ): Promise<RateLimitResult> {
-  const limiter = await getRateLimiter();
-  return limiter(key, cfg);
-}
-
-// ============================================================
-// REQUEST KEY HELPERS
-// ============================================================
-
-/**
- * Build a consistent rate-limit key from a Request.
- *
- * Combines client IP (from x-forwarded-for first entry, falling back to
- * x-real-ip) with the URL pathname. An optional `extra` suffix can be
- * appended (e.g. userId) to make per-user limits truly per-user.
- */
-export function requestKey(req: Request, extra = ""): string {
-  const xfwd = req.headers.get("x-forwarded-for");
-  const ip = xfwd
-    ? xfwd.split(",")[0]!.trim()
-    : req.headers.get("x-real-ip") ?? "unknown";
-  const url = new URL(req.url);
-  return `${ip}|${url.pathname}${extra ? `|${extra}` : ""}`;
-}
-
-/**
- * Build a per-user rate-limit key (stronger than per-IP because one user
- * on multiple IPs can't bypass, and NAT'd users don't share a bucket).
- */
-export function userKey(userId: string, extra = ""): string {
-  return `user:${userId}${extra ? `|${extra}` : ""}`;
+  return checkRateLimit(key, cfg);
 }

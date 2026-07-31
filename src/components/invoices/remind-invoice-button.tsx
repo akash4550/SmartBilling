@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import * as React from "react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { BellRing, Loader2 } from "lucide-react";
@@ -36,16 +36,40 @@ export function RemindInvoiceButton({
   className,
   onSent,
 }: RemindInvoiceButtonProps) {
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = React.useState(false);
+  const buttonRef = React.useRef<HTMLButtonElement | null>(null);
+  const abortRef = React.useRef<AbortController | null>(null);
 
-  async function handleClick() {
-    if (loading || disabled) return;
-    if (!confirm(`Send a payment reminder to ${clientEmail}?`)) return;
+  React.useEffect(() => {
+    return () => {
+      if (abortRef.current) abortRef.current.abort();
+    };
+  }, []);
+
+  async function handleClick(e: React.MouseEvent<HTMLButtonElement>) {
+    // ---- Synchronous DOM lock ----
+    const btn = e.currentTarget;
+    if (btn.disabled) return;
+    if (disabled) return;
+    btn.disabled = true;
+
+    // Confirm runs AFTER the lock; if user cancels we unlock immediately.
+    if (!confirm(`Send a payment reminder to ${clientEmail}?`)) {
+      btn.disabled = !!disabled;
+      return;
+    }
+
+    // ---- Abort prior in-flight reminder ----
+    if (abortRef.current) abortRef.current.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     setLoading(true);
     try {
       const res = await fetch(`/api/invoices/${invoiceId}/remind`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
@@ -68,9 +92,12 @@ export function RemindInvoiceButton({
         }`,
       });
       onSent?.();
-    } catch {
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
       toast.error("Network error — please try again");
     } finally {
+      if (abortRef.current === controller) abortRef.current = null;
+      btn.disabled = !!disabled;
       setLoading(false);
     }
   }
@@ -78,6 +105,7 @@ export function RemindInvoiceButton({
   return (
     <Button
       type="button"
+      ref={buttonRef}
       variant={variant}
       size={size}
       onClick={handleClick}

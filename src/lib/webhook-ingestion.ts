@@ -226,6 +226,35 @@ function getWorkerId(): string {
 }
 
 /**
+ * Sole quarantine gatekeeper used by the async webhook worker. Returns
+ * true iff the tenant has ledgerQuarantinedAt set. When true, the worker
+ * calls `markQuarantineHold()` without burning attempts — customer
+ * payments are held (status PENDING, attempts untouched) and resume
+ * after operator release.
+ *
+ * This is the ONLY place in the webhook pipeline that performs a
+ * quarantine read. Provider processors (processStripeEvent,
+ * processRazorpayEvent, processResendEvent) assume a healthy tenant
+ * context and run pure domain/ledger logic. A defense-in-depth PG
+ * trigger (ledger_quarantine_guard, SQLSTATE L0001) remains as a
+ * final backstop in case of a race between lookup and dispatch; any
+ * such throw is caught by the worker and routed to markQuarantineHold.
+ */
+export async function isTenantQuarantined(
+  userId: string,
+  client: AnyPrisma = defaultPrisma
+): Promise<boolean> {
+  const u = await client.user.findUnique({
+    where: { id: userId },
+    select: { ledgerQuarantinedAt: true },
+  });
+  return !!u?.ledgerQuarantinedAt;
+}
+
+/** Sentinel `lastError` string written to webhook_ingestions while on quarantine hold. */
+export const TENANT_QUARANTINED_ERR = "tenant_quarantined";
+
+/**
  * Place a row back into PENDING with lastError='tenant_quarantined' and
  * a 15-minute backoff. Used by the webhook worker when the owning tenant
  * is under ledger quarantine — we do NOT mark it failed/DLQ; we hold it

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import * as React from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -29,6 +29,14 @@ interface PayInvoiceButtonProps {
  * Razorpay flow creates an order via POST /api/invoices/:id/pay-razorpay,
  * opens the Razorpay modal, and verifies the returned signature via PATCH
  * /api/invoices/:id/pay-razorpay before marking PAID client-side.
+ *
+ * Double-click / overlapping-request hardening:
+ *   - Synchronous DOM lock on click (e.currentTarget.disabled = true)
+ *     before any await or state update.
+ *   - AbortController in a useRef; a second click aborts the first fetch
+ *     so only the latest request resolves.
+ *   - AbortError is filtered in catch() so no spurious toasts fire when
+ *     the user cancels by re-clicking.
  */
 export function PayInvoiceButton({
   invoiceId,
@@ -42,13 +50,25 @@ export function PayInvoiceButton({
   onPaid,
 }: PayInvoiceButtonProps) {
   const router = useRouter();
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = React.useState(false);
+  const buttonRef = React.useRef<HTMLButtonElement | null>(null);
+  const abortRef = React.useRef<AbortController | null>(null);
 
-  async function handleStripe() {
+  React.useEffect(() => {
+    return () => {
+      if (abortRef.current) abortRef.current.abort();
+    };
+  }, []);
+
+  async function handleStripe(
+    controller: AbortController,
+    btn: HTMLButtonElement
+  ) {
     try {
       const res = await fetch(`/api/invoices/${invoiceId}/pay`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
       });
       const data = await res.json().catch(() => ({}));
       if (res.status === 409 && data?.alreadyPaid) {
@@ -70,16 +90,36 @@ export function PayInvoiceButton({
         toast.error("Failed to start payment — no checkout URL returned");
         return;
       }
+      // Navigation away will tear down the page; don't bother unlocking
+      // the button — it's about to be destroyed.
       window.location.href = data.url;
-    } catch {
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
       toast.error("Network error — please try again");
+    } finally {
+      if (abortRef.current === controller) {
+        abortRef.current = null;
+        btn.disabled = !!(alreadyPaid);
+        setLoading(false);
+      }
     }
   }
 
-  async function handleRazorpay() {
+  async function handleRazorpay(
+    controller: AbortController,
+    btn: HTMLButtonElement
+  ) {
+    const cleanup = () => {
+      if (abortRef.current === controller) {
+        abortRef.current = null;
+        btn.disabled = !!(alreadyPaid);
+        setLoading(false);
+      }
+    };
     try {
       // 1. Ensure Razorpay checkout script is loaded.
       await loadRazorpayScript();
+      if (controller.signal.aborted) throw new DOMException("aborted", "AbortError");
       if (!(window as Window & { Razorpay?: unknown }).Razorpay) {
         toast.error("Razorpay failed to load — please check your ad blocker");
         return;
@@ -89,6 +129,7 @@ export function PayInvoiceButton({
       const res = await fetch(`/api/invoices/${invoiceId}/pay-razorpay`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
       });
       const data = await res.json().catch(() => ({}));
       if (res.status === 409 && data?.alreadyPaid) {
@@ -121,12 +162,12 @@ export function PayInvoiceButton({
         Razorpay?: new (opts: Record<string, unknown>) => {
           open: () => void;
           on: (ev: string, cb: (response: unknown) => void) => void;
+          close?: () => void;
         };
       };
       const Rzp = w.Razorpay;
       if (!Rzp) {
         toast.error("Razorpay failed to load");
-        setLoading(false);
         return;
       }
       const options = {
@@ -144,7 +185,7 @@ export function PayInvoiceButton({
         theme: { color: "#7c3aed" },
         modal: {
           ondismiss: () => {
-            setLoading(false);
+            cleanup();
           },
         },
         handler: async (response: { razorpay_payment_id: string; razorpay_order_id: string; razorpay_signature: string }) => {
@@ -157,7 +198,7 @@ export function PayInvoiceButton({
             if (!v.ok) {
               const err = await v.json().catch(() => ({}));
               toast.error(err.error || "Payment verification failed");
-              setLoading(false);
+              cleanup();
               return;
             }
             toast.success("Payment successful!", {
@@ -172,7 +213,7 @@ export function PayInvoiceButton({
             }
           } catch {
             toast.error("Could not verify payment — contact merchant if amount was debited");
-            setLoading(false);
+            cleanup();
           }
         },
       };
@@ -180,25 +221,43 @@ export function PayInvoiceButton({
       const rzp = new Rzp(options as Record<string, unknown>);
       rzp.on("payment.failed", () => {
         toast.error("Payment failed — please try again or use a different method");
-        setLoading(false);
+        cleanup();
+      });
+      // If the user bails out via a second click, dismiss the Razorpay
+      // modal so it doesn't outlive the aborted request.
+      controller.signal.addEventListener("abort", () => {
+        try { rzp.close?.(); } catch { /* ignore */ }
       });
       rzp.open();
-    } catch {
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
       toast.error("Something went wrong — please try again");
-      setLoading(false);
+    } finally {
+      // Razorpay modal's ondismiss/handler take responsibility for
+      // unlocking once the modal flow resolves; if we never reached the
+      // open() call, unlock here.
+      cleanup();
     }
   }
 
-  async function handleClick() {
-    if (loading || alreadyPaid) return;
+  function handleClick(e: React.MouseEvent<HTMLButtonElement>) {
+    // ---- Synchronous DOM lock ----
+    const btn = e.currentTarget;
+    if (btn.disabled) return;
+    if (alreadyPaid) return;
+    btn.disabled = true;
+
+    // ---- Abort prior in-flight attempt ----
+    if (abortRef.current) abortRef.current.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     setLoading(true);
     if (provider === "razorpay") {
-      await handleRazorpay();
+      void handleRazorpay(controller, btn);
     } else {
-      await handleStripe();
+      void handleStripe(controller, btn);
     }
-    // Note: stripe path navigates away; razorpay resets via modal lifecycle.
-    if (provider !== "razorpay") setLoading(false);
   }
 
   const Icon = provider === "razorpay" ? IndianRupee : CreditCard;
@@ -209,6 +268,7 @@ export function PayInvoiceButton({
   return (
     <Button
       type="button"
+      ref={buttonRef}
       variant={variant}
       size={size}
       onClick={handleClick}

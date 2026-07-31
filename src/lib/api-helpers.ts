@@ -17,19 +17,97 @@ export interface ApiError {
 // ============================================================
 
 /**
- * Constant-time string comparison to mitigate timing attacks.
- * Use for shared-secret comparisons (CRON_SECRET, webhook tokens).
+ * Per-process random key used by safeCompareSecrets() to fold the two
+ * inputs into equal-length HMAC digests before invoking
+ * crypto.timingSafeEqual(). This guarantees we never (a) throw a
+ * RangeError because Buffer byte lengths differ, or (b) leak the
+ * expected secret's length via an early-return timing branch.
+ *
+ * A fresh nonce is generated on module load; we only need it to be
+ * stable for the lifetime of the process because no comparison result
+ * is ever persisted or compared across restarts.
  */
-export function timingSafeEqual(a: string, b: string): boolean {
-  if (typeof a !== "string" || typeof b !== "string") return false;
-  if (a.length !== b.length) return false;
-  const bufA = Buffer.from(a, "utf8");
-  const bufB = Buffer.from(b, "utf8");
+const SAFE_COMPARE_KEY: Buffer = (() => {
   try {
-    return crypto.timingSafeEqual(bufA, bufB);
+    return crypto.randomBytes(32);
+  } catch {
+    // Extremely defensive: entropy-starved environments (testing
+    // sandboxes without /dev/urandom). Falling back to a zero-filled
+    // buffer still gives us equal-length digests for comparison; the
+    // comparison result is never used for persistent MAC verification.
+    return Buffer.alloc(32, 0);
+  }
+})();
+
+/** Empty buffer reused for the "no expected secret" fast-path. */
+const EMPTY = Buffer.alloc(0);
+
+function toSecretBuffer(s: unknown): Buffer {
+  // Accept only non-empty strings. Null / undefined / number / object
+  // are treated as empty → comparison will fail. Empty strings also
+  // fail: a bare "Authorization: Bearer " header must never match a
+  // set secret, and vice versa.
+  if (typeof s !== "string") return EMPTY;
+  const trimmed = s; // do NOT trim — secrets can legitimately contain
+  // leading/trailing whitespace; trimming would mask configuration bugs.
+  if (trimmed.length === 0) return EMPTY;
+  return Buffer.from(trimmed, "utf8");
+}
+
+/**
+ * Timing-safe string comparison for shared secrets (CRON_SECRET,
+ * webhook tokens, HMAC signatures).
+ *
+ * Why not `crypto.timingSafeEqual(a, b)` directly? Because it
+ * (a) throws `RangeError` when the two buffers have different byte
+ * lengths, turning a bad/short attacker probe into a 500 instead of a
+ * clean 401, and (b) the obvious `if (a.length !== b.length) return false`
+ * short-circuit leaks the secret's byte length via a timing
+ * side-channel.
+ *
+ * This implementation:
+ *   1. Returns `false` for null / undefined / empty / non-string input.
+ *   2. Converts both inputs to UTF-8 Buffers.
+ *   3. HMAC-SHA256s each with a per-process random key so both digests
+ *      are always exactly 32 bytes — length mismatch cannot occur and
+ *      the comparison does not branch on the input length.
+ *   4. Compares the two digests with crypto.timingSafeEqual inside a
+ *      try/catch as a final guard against unexpected throw modes.
+ *
+ * IMPORTANT: this is intended for bearer-token / shared-secret
+ * equality only. It does NOT replace HMAC signature verification
+ * against webhook payloads (those should use the provider-specific
+ * HMAC computed over the raw body, compared per-provider).
+ */
+export function safeCompareSecrets(
+  provided: unknown,
+  expected: unknown
+): boolean {
+  const a = toSecretBuffer(provided);
+  const b = toSecretBuffer(expected);
+  // If either side was empty, comparison fails. Explicit branch is
+  // safe here: it only tells the attacker "you sent nothing" vs
+  // "something", which is not a secret.
+  if (a === EMPTY || b === EMPTY) return false;
+  try {
+    const ha = crypto.createHmac("sha256", SAFE_COMPARE_KEY).update(a).digest();
+    const hb = crypto.createHmac("sha256", SAFE_COMPARE_KEY).update(b).digest();
+    // Both digests are exactly 32 bytes by construction;
+    // timingSafeEqual cannot throw RangeError, but we keep the guard
+    // belt-and-braces in case of unexpected runtime behavior.
+    return crypto.timingSafeEqual(ha, hb);
   } catch {
     return false;
   }
+}
+
+/**
+ * Backwards-compatible alias. New code should prefer `safeCompareSecrets`
+ * which accepts unknown/null/undefined safely, but this export keeps
+ * existing call sites working.
+ */
+export function timingSafeEqual(a: string, b: string): boolean {
+  return safeCompareSecrets(a, b);
 }
 
 /**

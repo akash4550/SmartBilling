@@ -418,72 +418,442 @@ The webhook DLQ is now an operational subsystem, not a graveyard:
 
 ---
 
-## 🛡️ Ledger Audit Console (Admin)
+## 🛡️ Automated Ledger Drift &amp; Integrity Reconciler (v1 — Production)
 
-SmartBill ships with an internal **Admin Audit Console** at `/admin/ledger`
-(visible to signed-in users via the User Menu → "Ledger Audit Console"):
+SmartBill ships a tamper-evident, double-entry financial ledger with a
+fail-closed reconciler and a first-class **Admin Audit Console** at
+`/admin/ledger` (User Menu → "Ledger Audit Console"). The subsystem is
+engineered like a database kernel: **integrity is enforced in PostgreSQL
+itself**, not in TypeScript ORM code, so a bug in the application layer
+cannot silently corrupt the books.
 
-- **Section A — Health Banner.** Green/amber/red/slate status derived from the
-  latest reconciliation run. Tiles show Open Receivables, Cash (ledger), Paid
-  Invoices Σ, and Expenses Σ with Δ vs. read-model aggregates. Buttons:
-  "Run Reconciler Now", "Backfill & Re-verify", and either "Release
-  Quarantine…" (mandatory audit note + optional Force) or "Quarantine…"
-  depending on state.
-- **Section B — Hash-Chain Explorer.** Newest-first table of the SHA-256
-  chained double-entry ledger with Dr/Cr side chips, copy-hash button, and
-  a click-to-expand row that shows the prev ↓ entry hash link and full
-  metadata (eventId, invoice/expense ids, currency, timestamp, note).
-  "Load older entries" paginates back to 200 rows.
-- **Section C — Audit History.** Collapsible list of every reconciliation
-  run with status badges, severity pills (crit/high/med), scanned-row
-  count, duration, and expanded expected/actual/Δ breakdown for each
-  discrepancy.
+### System Architecture
 
-### How reconciliation works
+```mermaid
+flowchart TD
+    subgraph Edge["Edge Ingestion (Next.js 16 Route Handlers)"]
+        StripeWH["Stripe Webhook<br/>checkout.session.completed<br/>HMAC-verified"]
+        RazorWH["Razorpay Webhook<br/>payment.captured<br/>HMAC-verified"]
+        Cron["Vercel Cron<br/>reconcile */15min &amp; 03:00 IST<br/>generate-recurring hourly<br/>process-webhooks * * * * *"]
+        BrowserOps["Operator Browser<br/>/admin/ledger RSC + Server Actions"]
+    end
 
-Two sweeps per tenant, every 15 min (incremental) and at 03:00 IST (full):
+    subgraph Queue["Webhook SKIP-LOCKED Worker Queue"]
+        Ingest["Thin edge → INSERT<br/>WebhookIngestion rawBody<br/>202 Accepted in &lt;50ms"]
+        Worker["/api/cron/process-webhooks<br/>SELECT … FOR UPDATE SKIP LOCKED<br/>exp-backoff 5s·2^n → DLQ → POISON"]
+        Ingest --> Worker
+    end
 
-- **Sweep A** — Streams the ledger 500 rows at a time, verifies each SHA-256
-  chain link, checks for entry-index gaps, and asserts ΣD = ΣC per eventId.
-- **Sweep B** — SQL-pushed-down balance cross-checks:
-  - `ACCOUNTS_RECEIVABLE` signed balance vs. Σ PENDING invoice totals.
-  - `CASH` signed balance vs. per-event CASH aggregate (handles refunds and
-    void-payment reversals correctly — no false positives after a
-    `PAYMENT_REVERSED`).
-  - `EXPENSES` signed balance vs. Σ expenses table.
-  - MEDIUM-only Revenue/Tax parity (scoped to issuance/void events).
+    subgraph AppLayer["Application Layer (Node, Server Components + Actions)"]
+        Rate["Distributed Sliding-Window Rate Limiter<br/><b>Upstash Redis</b> when UPSTASH_REDIS_REST_URL/TOKEN set<br/><b>In-memory Map</b> graceful fallback<br/>10 req / 60s per user"]
+        Rsc["RSC page.tsx<br/>Promise.all overview + first chain page + recent audits"]
+        Actions["Server Actions<br/>triggerReconcile / release / quarantine / backfill / loadMore"]
+        APIRoutes["Admin REST API<br/>/api/admin/ledger/[tenantId]/{quarantine,audit}<br/>Same-origin CSRF + CRON_SECRET + session.user.id===tenantId"]
+    end
 
-One idempotent auto-backfill runs for AR/CASH/EXPENSE mismatches when there
-is no structural hash/gap failure; CRITICAL or residual HIGH drift flips
-`users.ledgerQuarantinedAt` and **blocks all financial writes** via three
-defense layers: `assertNotQuarantined()` before the chain lock,
-`withTenant()` pre-tx check, and a `BEFORE INSERT OR UPDATE OR DELETE`
-trigger raising SQLSTATE `L0001` on `invoices`, `invoice_items`,
-`expenses`, `ledger_entries`.
+    subgraph TenantGate["Database-Kernel Isolation"]
+        WTenant["withTenant(uid, fn)<br/>SET LOCAL ROLE app_user<br/>SET LOCAL app.current_user_id = uid<br/>assertion fail-closed"]
+        WService["withService(name, fn)<br/>SET LOCAL ROLE service_role<br/>SET LOCAL app.service_name = name<br/>discovery-only OR-policy; writes re-enter withTenant"]
+        AppRole["app_user role<br/>NOINHERIT NOBYPASSRLS<br/>SELECT/INSERT only on ledger_entries<br/>no UPDATE/DELETE on financial tables"]
+        SvcRole["service_role role<br/>NOINHERIT NOBYPASSRLS<br/>OR-clause USING for discovery<br/>WITH CHECK enforces userId match"]
+    end
 
-Webhook payments for quarantined tenants are held (not DLQ'd) and resume
-processing after release.
+    subgraph LedgerCore["Accounting Truth (PostgreSQL 17)"]
+        LedgerTbl[(ledger_entries<br/>append-only, SHA-256 chained)]
+        SixTables[(invoices<br/>invoice_items<br/>expenses<br/>ledger_entries<br/>recurring_profiles<br/>recurring_items)]
+        BalanceTrig["ledger_assert_balanced_insert()<br/>AFTER INSERT per-statement<br/>Σ debits = Σ credits per eventId<br/>integer paise"]
+        QuarTrig["ledger_quarantine_guard()<br/>BEFORE INSERT OR UPDATE OR DELETE<br/>raises SQLSTATE L0001 when<br/>users.ledgerQuarantinedAt IS NOT NULL<br/>(empty GUC pass-through for migrations/backfills)"]
+        AdvLock["pg_advisory_xact_lock<br/><b>ns 1397772900n</b> → ledger posting<br/><b>ns 1397772901n</b> → reconcile<br/><b>ns 1397772876n</b> → recurring profiles"]
+        HashChain["entryHash = SHA256(prevEntryHash ‖ canonical_bytes)<br/>canonical = eventId|eventType|account|side|amountPaise|invoiceId|expenseId|currency<br/>lastLedgerEntryHash/Id updated atomically in tx"]
+    end
 
-### API endpoints
+    subgraph Reconciler["Automated Reconciler (Sweep A + Sweep B)"]
+        SweepA["Sweep A — Hash-Chain Integrity<br/>Streaming keyset cursor LIMIT 500<br/>• SHA-256 link verification<br/>• entryIndex gap detection<br/>• per-event ΣD = ΣC<br/>• tail-pointer sync check"]
+        SweepB["Sweep B — Balance Cross-Checks<br/>SQL-pushed aggregates<br/>• AR ↔ Σ PENDING invoices<br/>• CASH ↔ signed Σ payment events<br/>• EXPENSES ↔ Σ expenses<br/>• Revenue/Tax parity (issuance-scoped)"]
+        AuditRow[(reconciliation_audits<br/>PASSED / DRIFT_DETECTED / HASH_BROKEN / TRANSIENT_FAILURE<br/>critical/high/medium/info counts<br/>autoRemediated flag)]
+        Quarantine["On CRITICAL / residual HIGH:<br/>1. SET users.ledgerQuarantinedAt<br/>2. Write HASH_BROKEN/DRIFT audit row<br/>3. fireDriftAlerts() cooldowns CRIT 60m / HIGH 6h / MED 24h"]
+    end
 
-| Method | Path | Purpose |
-|---|---|---|
-| GET/POST | `/api/cron/reconcile?mode=incremental\|full\|single&tenantId=…` | Cron entry point (Bearer `CRON_SECRET`). |
-| GET/POST | `/api/cron/reconcile-ledger` | Alias. |
-| GET | `/api/admin/ledger/:tenantId/quarantine` | Current quarantine state + latest audit. |
-| POST | `/api/admin/ledger/:tenantId/quarantine` | `{action: quarantine\|release\|backfill\|reconcile, reason, force?}`. Session callers are scoped to their own tenant; service callers use Bearer `CRON_SECRET`. Same-origin CSRF check enforced for cookie sessions. |
-| GET | `/api/admin/ledger/:tenantId/audit?limit=N` | Recent audit rows. |
+    subgraph UI["Admin Audit Console /admin/ledger"]
+        Banner["Section A · Health Banner<br/>emerald/amber/red/gray<br/>WRITES BLOCKED pulsing badge<br/>4-metric grid with BigInt Δ vs read models"]
+        Explorer["Section B · Hash-Chain Explorer<br/>Dr/Cr chips · copy-hash · expandable prev↔entry rows<br/>keyset-cursor pagination (Load 50 More)"]
+        History["Section C · Audit History<br/>severity pills · duration · expected/actual/Δ"]
+        Buttons["Run Reconciler · Backfill &amp; Re-verify<br/>Release (mandatory note + Force checkbox)<br/>Quarantine (mandatory note)"]
+    end
 
-### Setup
+    StripeWH --> Ingest
+    RazorWH --> Ingest
+    Cron --> Worker
+    Cron --> APIRoutes
+    BrowserOps --> Rate --> Rsc --> Actions
+    Actions --> WTenant
+    APIRoutes --> WService
 
-After `prisma db push`, apply the RLS, service-role, ledger trigger, and
-reconciler SQL files, then seed. The `npm run db:setup` script chains
-these steps for a fresh database:
+    Worker --> WService
+    WTenant --> AppRole
+    WService --> SvcRole
+
+    AppRole --> SixTables
+    AppRole --> LedgerTbl
+    SvcRole --> SixTables
+    SvcRole --> LedgerTbl
+
+    LedgerTbl --> HashChain --> AdvLock
+    SixTables --> QuarTrig
+    LedgerTbl --> BalanceTrig
+
+    SweepA --> LedgerTbl --> AdvLock
+    SweepB --> SixTables
+    SweepB --> LedgerTbl
+    SweepA --> AuditRow
+    SweepB --> AuditRow
+    SweepA --> Quarantine
+    SweepB --> Quarantine
+    Quarantine -. sets flag, L0001 trigger then blocks all financial writes .-> SixTables
+    Worker -. "markQuarantineHold()<br/>status=PENDING lastError=tenant_quarantined<br/>nextAttemptAt=+15min (no attempt increment)" .-> Ingest
+
+    Rsc --> Banner
+    Rsc --> Explorer
+    Rsc --> History
+    Actions --> Buttons
+    Buttons --> Banner
+    Actions -. "router.refresh() hydrates" .-> Rsc
+
+    classDef kernel fill:#fee2e2,stroke:#b91c1c,color:#000
+    classDef integrity fill:#fef3c7,stroke:#b45309,color:#000
+    classDef worker fill:#dbeafe,stroke:#1d4ed8,color:#000
+    classDef ui fill:#dcfce7,stroke:#15803d,color:#000
+    class BalanceTrig,QuarTrig,AdvLock,HashChain,AppRole,SvcRole,WTenant,WService kernel
+    class SweepA,SweepB,AuditRow,Quarantine,Rate integrity
+    class Worker,Ingest worker
+    class Banner,Explorer,History,Buttons,Rsc,UI ui
+```
+
+### Core Architectural Invariants (The "Why")
+
+Each decision below is a deliberate guard against a specific class of
+failure that an ORM-layer guard alone cannot prevent.
+
+#### 1. Asymmetric Least-Privilege RLS (kernel-level USING vs. WITH CHECK)
+
+Application-level `where: { userId }` filters are a convenience, not a
+security boundary — any code path that forgets the clause (a new
+endpoint, a debugging patch, a future engineer's typo) silently leaks
+cross-tenant data. SmartBill enforces tenant isolation *in the database
+kernel* via two restricted roles, `app_user` and `service_role`, both
+created with `NOINHERIT NOBYPASSRLS`:
+
+- `withTenant(uid, fn)` opens a transaction, runs
+  `SET LOCAL ROLE app_user; SET LOCAL app.current_user_id = '<uid>';`,
+  and **asserts both SETs took effect** before the callback runs. If the
+  SET is rejected (role misconfiguration, dropped GUC), the tx aborts
+  rather than silently running as superuser.
+- RLS `USING` clauses filter *visible* rows — a tenant query can only
+  ever see rows where `userId = current_setting('app.current_user_id')`
+  (or, for `service_role`, the service-discovery OR clause). There is no
+  statement the application can issue that returns another tenant's
+  rows, because the database itself filters the result set before rows
+  leave the executor.
+- RLS `WITH CHECK` clauses are **asymmetric**: they enforce that
+  *writes* must set `userId = current_setting('app.current_user_id')`,
+  even for `service_role`. A cron running as `service_role` can
+  *discover* tenants across the system to know whom to reconcile, but
+  cannot insert or mutate a row without re-entering `withTenant(uid)`
+  to pin `app.current_user_id` to that exact tenant.
+- The result is a kernel-style **fail-closed** posture: the Prisma client
+  is a prisoner of its role, not a trusted peer. Buggy application code
+  fails loudly with a Postgres permission error instead of silently
+  exfiltrating or corrupting another tenant's data.
+
+`SET LOCAL` scope (transaction-local, auto-reset on commit/rollback) is
+critical: pooled connections cannot leak role or GUC state between
+requests even if the Node process crashes mid-query.
+
+#### 2. Advisory-Locked Chained Ledgers (split namespaces 1397772900n / 1397772901n)
+
+Every ledger append must: (a) read the current tail hash, (b) compute
+`entryHash = SHA256(prevEntryHash ‖ canonical_bytes)`, (c) insert the
+new rows, and (d) update the user's `lastLedgerEntryHash`/`lastLedgerEntryId`.
+Without serialization, two concurrent webhooks could read the same
+`prevEntryHash` and fork the chain — a tamper-evidence failure that
+Sweep A would later flag as CRITICAL `HASH_CHAIN_BROKEN`. Rather than
+rely on a heavyweight table lock or SERIALIZABLE isolation (both
+disastrous for throughput), we use `pg_advisory_xact_lock` with
+**deliberately separate namespaces**:
+
+| BigInt key                | Namespace      | Purpose                                                 |
+|---------------------------|----------------|---------------------------------------------------------|
+| `1397772900n * 2^32 + h`  | Ledger Posting | Serializes `postLedgerEvent(s)` writes for one tenant.  |
+| `1397772901n * 2^32 + h`  | Reconcile      | Serializes concurrent reconcile runs for one tenant.    |
+| `1397772876n * 2^32 + h`  | Recurring      | Guards recurring-invoice generation per profile.        |
+
+The namespace IDs are FNV-1a 32-bit folds of symbolic names (e.g.,
+`"smartbill:ledger:post"`, `"smartbill:ledger:reconcile"`), shifted
+into the high 32 bits so user-hash collisions across namespaces are
+impossible.
+
+**Why split the posting and reconcile namespaces?** A reconcile run
+takes tens to hundreds of milliseconds per tenant (Sweep A streams the
+entire chain). If it held the *posting* lock for that duration, bursty
+webhook payments during a reconcile window would serialize behind it
+and pile up in the SKIP-LOCKED ingestion queue, increasing payment
+latency and triggering duplicate webhook retries from Stripe/Razorpay.
+By giving reconciles their own lock, webhook writes continue to commit
+on the hot path while the reconcile holds a *logically separate* guard
+against concurrent reconcile invocations. The reconciler uses
+`pg_try_advisory_xact_lock` on its namespace — contention (e.g., an
+incremental cron firing while an operator is mid-backfill) returns
+`TRANSIENT_FAILURE` immediately rather than queuing behind a lock.
+
+#### 3. Three-Layer Fail-Closed Quarantine (app → webhook hold → SQLSTATE L0001)
+
+When Sweep A detects a broken hash chain, an entry-index gap, or an
+unbalanced event, OR Sweep B detects residual high-severity drift that
+auto-backfill cannot resolve, the reconciler flips
+`users.ledgerQuarantinedAt` and all further **financial writes must
+block** until an operator releases the flag after review. This is
+enforced in three independent layers, because one of them is not
+enough:
+
+1. **Application helper** — `assertNotQuarantined(uid)` is called
+   *before* `postLedgerEvent` acquires the chain lock, and
+   `withTenant()` runs a pre-tx quarantine check. This is the hot-path
+   gate: it fails fast with a typed `LedgerQuarantinedError`, returns a
+   clean error to the UI, and avoids burning a transaction on work that
+   will be rejected downstream.
+2. **Webhook hold (no poison, no DLQ)** — the `process-webhooks` worker
+   calls `isTenantQuarantined()` before dispatching a payment event
+   and, if quarantined, calls `markQuarantineHold()` which sets
+   `status=PENDING`, `lastError='tenant_quarantined'`, and
+   `nextAttemptAt=now + 15min` without incrementing `attempts`.
+   Quarantined payments are not dropped into the DLQ (that would lose
+   revenue) and not marked poison — they wait on the queue until the
+   operator releases the flag, then drain normally.
+3. **Database trigger SQLSTATE `L0001`** — `ledger_quarantine_guard()`
+   is a `BEFORE INSERT OR UPDATE OR DELETE` trigger attached (via a
+   dynamic `DO` block that checks `information_schema.tables`, so the
+   DDL is idempotent against schema drift) to **all six financial
+   tables**: `invoices`, `invoice_items`, `expenses`, `ledger_entries`,
+   `recurring_profiles`, `recurring_items`. It raises SQLSTATE `L0001`
+   whenever `app.current_user_id` is non-empty *and* the user's
+   `ledgerQuarantinedAt IS NOT NULL`. This is the last line of defense:
+   even if a bug slips past the helper, a raw query is run via
+   Prisma's `$executeRaw`, or an RLS policy is ever relaxed, the
+   trigger still fires inside the executor and aborts the transaction.
+   The trigger deliberately permits the empty/NULL GUC so migrations,
+   superuser backfills, and `service_role` discovery don't wedge; all
+   trusted paths run with known empty or non-user GUCs, and every
+   tenant-facing `withTenant` call sets the GUC unconditionally, so
+   the trigger fails *closed* for untrusted traffic.
+
+The vitest integration suite (`src/lib/reconciler.test.ts`, Test C)
+asserts all three layers: the helper throws, a Prisma-tx write throws,
+and a raw PL/pgSQL INSERT as `app_user` with `app.current_user_id` set
+raises `L0001`.
+
+#### 4. Keyset Streaming + Zero-Float Paise (O(batch) memory, no IEEE 754 drift)
+
+Two independent correctness choices that are easy to get wrong:
+
+- **Zero JavaScript floats for money.** Every monetary amount is stored
+  as integer paise in `BigInt` (or as Prisma `Decimal(12,2)` with an
+  explicit `ROUND_HALF_UP` to integer subunits at the boundary). GST at
+  18% on ₹1000 is `BigInt("118000")` paise internally. There is no
+  `0.1 + 0.2 === 0.30000000000000004` footgun anywhere on the write
+  path, in the balance trigger (which sums integer paise), or in the
+  reconciler. Display formatting happens once, at the React boundary,
+  using `Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR' })`
+  against an integer-to-decimal divisor.
+- **Keyset (cursor) pagination, everywhere.** The reconciler's Sweep A
+  walks the hash chain 500 rows at a time with a `WHERE entryIndex >
+  cursor ORDER BY entryIndex ASC LIMIT 500` loop, with a bounded
+  tail-catch-up of five extra iterations for concurrent-appended
+  entries. The Admin Console's Hash-Chain Explorer uses the same
+  pattern on `entryIndex DESC` with a cursor resolved from the last
+  row's `id`, so "Load 50 More" has constant-time plans regardless of
+  chain length. `OFFSET`-based pagination is not used anywhere on the
+  ledger: on a chain with 1M entries, `OFFSET 500000 LIMIT 50` would
+  force Postgres to sort and discard 500 000 rows on every page and
+  produce inconsistent results under concurrent writes. Keyset cursors
+  are O(batch) memory and stay consistent in the face of concurrent
+  inserts.
+
+Sweep B goes further: instead of loading every row into Node to sum
+balances (the O(n)-memory anti-pattern), every cross-check is a SQL
+aggregate (`SELECT SUM(...) FILTER (WHERE ...)`), pushed down to the
+database and returned as a single row. The reconciler itself can run
+comfortably inside Vercel's Serverless Function memory ceiling even on
+tenants with millions of ledger rows.
+
+### Admin Audit Console — Operating Manual
+
+The console at `/admin/ledger` is a React Server Component that
+hydrates from three parallel promises (`getTenantAuditOverview`, first
+keyset page of 50 chain entries, most recent 25 audit rows) and hands
+them to a single `"use client"` component (`ledger-admin.tsx`). All
+mutations flow through `"use server"` actions that share a unified
+refresh payload so every button click rehydrates the banner, chain,
+and audit history in **one RTT** with no `window.location.reload`.
+
+#### Section A — Health Banner
+
+- **emerald** = last reconcile PASSED, not quarantined, all four Δ
+  metrics at zero.
+- **amber** = last reconcile passed with INFO/MEDIUM findings (e.g.,
+  issuance-scoped revenue/tax parity drift that the engine didn't
+  auto-fix).
+- **red** = DRIFT_DETECTED or HASH_BROKEN; quarantined is `true`; a
+  pulsing **WRITES BLOCKED** badge is rendered; all financial APIs
+  (invoice create/edit/pay, expense create, recurring generate,
+  webhook processing for this tenant) will reject at one of the three
+  quarantine layers.
+- **gray** = no reconciliation has ever run for this tenant (fresh
+  account).
+- Four metric tiles: Open Receivables (AR), Cash on ledger, Paid
+  Invoices Σ, Expenses Σ, each with a BigInt Δ vs. the Invoice/Expense
+  read-model aggregates so an operator sees exactly which aggregate
+  disagrees before drilling into Section C.
+
+#### Section B — Hash-Chain Explorer
+
+- Newest-first table of `LedgerEntry` rows with `DEBIT`/`CREDIT` side
+  chips and copy-to-clipboard entry hash.
+- Click a row to expand the canonical hash-link visualization:
+  `prevEntryHash ↓ entryHash` in monospace, with full metadata
+  (eventId, eventType, account, invoice/expense id, currency,
+  timestamp, note).
+- **"Load 50 More Entries"** button triggers the
+  `loadMoreLedgerEntriesAction` server action, which goes through the
+  same auth/tenant-isolation/rate-limit pipeline as mutations to
+  prevent a compromised session from scraping another tenant's chain.
+  The button is hidden when `nextCursor === null` and shows a spinner
+  during fetch. After any mutation, `refreshChain()` resets to the
+  first page with a `take = max(currentEntries.length, 50)` so newly
+  appended entries appear at the top without clobbering scroll
+  position.
+
+#### Section C — Audit History
+
+- Collapsible list of every `reconciliation_audits` row, newest first,
+  with status badges (PASSED / DRIFT_DETECTED / HASH_BROKEN /
+  TRANSIENT_FAILURE) and severity count pills (critical / high /
+  medium / info).
+- Expanding a row shows scanned-row count, duration, worker id,
+  reconciler version, and an expected/actual/Δ paise breakdown for
+  each discrepancy (formatted with the same `formatPaise` helper used
+  by the UI so the numbers reconcile visually with Section A).
+
+#### Operator Controls &amp; the Force-Release Workflow
+
+All four mutation buttons share: (a) session auth via `requireUser()`,
+(b) strict tenant id regex + `session.user.id === tenantId` check
+(redirects to `/login` on mismatch — never reveals tenant existence),
+(c) same-origin CSRF check on cookie sessions, (d) the distributed
+rate limiter (10 req / 60 s per user — see below).
+
+- **Run Reconciler Now** → `triggerTenantReconcileAction(uid)` with
+  `force:true` (skips the engine's minimum-interval gate). Returns the
+  serialized audit row.
+- **Backfill &amp; Re-verify** → `backfillTenantAction(uid)` runs
+  `operatorBackfill(uid)` (idempotently posts `INVOICE_ISSUED` for
+  non-DRAFT invoices missing an issuance entry, plus PAID/VOIDED/
+  EXPENSE_RECORDED as current state dictates), then a reconcile with
+  `skipAutoBackfill` to avoid a second backfill pass.
+- **Quarantine…** → prompts for a mandatory audit note (≤ 500 chars,
+  trimmed), then calls `quarantineTenantAction`. Used when an operator
+  suspects fraud, an import has corrupted data, or a migration went
+  sideways — flips the quarantine flag without needing to wait for a
+  reconcile cycle.
+- **Release Quarantine…** → the safety-critical control.
+  - Without **Force**, the engine runs a fresh reconcile and refuses
+    to clear the flag unless the result is PASSED; residual drift
+    leaves the flag set and returns `{ok:false, error}`.
+  - With **Force** (labeled as an emergency override, destructive
+    styling, confirmation checkbox), the flag is cleared
+    unconditionally, and a confirm-run in `auditOnly:true` mode logs
+    any residual drift as an INFO audit row *without re-quarantining*.
+    This exists for two scenarios: (i) the operator has reviewed the
+    discrepancies and accepted them as a known-good state change
+    (e.g., a manually corrected opening balance), and (ii) emergency
+    restoration of service while post-mortem is ongoing.
+  - In both modes, an audit note is **mandatory** and becomes the
+    `reason` on the release audit row so every state transition has a
+    durable, attributable paper trail.
+
+**Distributed rate limiting.** Server actions call
+`assertMutationRateLimit(uid)` from `src/lib/rate-limiter.ts`. When
+`UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` are set, the
+limiter evaluates a Lua sliding-window script over Upstash's REST API
+with a 1.5 s timeout; on any timeout, network failure, or missing
+credentials, it transparently falls back to an in-process `Map`-based
+window so the app never crashes due to Redis unavailability. A single
+stderr notice logs the fallback event once per process lifetime.
+
+### Setup &amp; Verification Commands
+
+SmartBill's Prisma schema, RLS policies, service role, ledger triggers,
+and reconciler guard triggers are all applied via a single chainable
+setup script. On a fresh PostgreSQL database:
 
 ```bash
+# 1. Install dependencies
+npm install
+
+# 2. Apply Prisma schema, RLS, service-role, ledger triggers,
+#    reconciler guard (6 tables), and seed the demo account.
+#    Requires a running Postgres with the superuser role from prisma/schema.prisma.
 DATABASE_URL="postgresql://smartbill:smartbill@localhost:5432/smart_billing?schema=public" \
   npm run db:setup
 ```
 
-A production-readiness audit of the full reconciler + UI stack is in
-[`LEDGER_AUDIT_REPORT.md`](./LEDGER_AUDIT_REPORT.md).
+For CI and for verifying a change to the reconciler, ledger, or rate
+limiter hasn't broken invariants:
+
+```bash
+# TypeScript strict-mode check (zero any, strict nulls)
+./node_modules/.bin/tsc --noEmit
+
+# Reconciler integration suite: 4 tests covering PASSED,
+# auto-remediate backfill, hash-tamper → HASH_BROKEN + quarantine
+# + L0001 trigger at the SQL layer, and force-release semantics.
+npm test -- src/lib/reconciler.test.ts
+
+# Authoritative production build (prisma generate + next build);
+# fails on any tsc or RSC/server-action type error.
+npx next build
+```
+
+The vitest suite provisions a stable `usr_reconciler_ci` test user
+and resets all financial tables between tests, so it can be run
+repeatedly against a local database without side effects.
+
+### API Surface (Summary)
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET/POST | `/api/cron/reconcile?mode=incremental\|full\|single&tenantId=…` | Cron entry point, Bearer `CRON_SECRET`. `incremental` every 15 min, `full` at 03:00 IST. |
+| GET/POST | `/api/cron/reconcile-ledger` | Alias for `/api/cron/reconcile` with dynamic config loading. |
+| GET | `/api/admin/ledger/:tenantId/quarantine` | Current quarantine state + latest audit. |
+| POST | `/api/admin/ledger/:tenantId/quarantine` | `{action: quarantine\|release\|backfill\|reconcile, reason, force?}`. Session callers scoped to own tenant; service callers use Bearer `CRON_SECRET`. Same-origin CSRF enforced. |
+| GET | `/api/admin/ledger/:tenantId/audit?limit=N` | Recent audit rows. |
+
+All server actions (trigger, release, quarantine, backfill, loadMore)
+are callable directly from client components via the imported
+`"use server"` references and don't have separate HTTP endpoints.
+
+### Drift Taxonomy
+
+| Severity | Code | Meaning | Auto-remediated? |
+|---|---|---|---|
+| CRITICAL | `HASH_CHAIN_BROKEN` | `entryHash` / `prevEntryHash` mismatch (tampering or bug) | No → quarantine |
+| CRITICAL | `TAIL_POINTER_DESYNC` | User's `lastLedgerEntryId` doesn't match chain tail | Yes, in-tx |
+| CRITICAL | `UNBALANCED_EVENT` | Σ debits ≠ Σ credits for an eventId | No → quarantine |
+| CRITICAL | `ENTRY_INDEX_GAP` | Non-contiguous `entryIndex` (deleted/skipped row) | No → quarantine |
+| HIGH | `AR_MISMATCH` | Ledger AR balance ≠ Σ PENDING invoice totals | Yes (backfill) |
+| HIGH | `CASH_MISMATCH` | Ledger CASH balance ≠ signed Σ payment events | Yes (backfill) |
+| HIGH | `EXPENSE_MISMATCH` | Ledger EXPENSES ≠ Σ expenses table | Yes (backfill) |
+| MEDIUM | `REVENUE_TAX_MISMATCH` | Issuance-scoped revenue/tax parity | Information only |
+| INFO | `TRANSIENT_ERROR` | Reconcile hit lock contention / retryable SQLSTATE | Next cron picks up |
+
+A separate production-readiness audit of the full reconciler + UI
+stack is maintained in [`LEDGER_AUDIT_REPORT.md`](./LEDGER_AUDIT_REPORT.md).

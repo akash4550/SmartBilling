@@ -11,19 +11,21 @@ import LedgerAdmin from "./_components/ledger-admin";
 export const dynamic = "force-dynamic";
 
 /**
- * Admin Ledger Audit Console.
+ * Admin Ledger Audit Console — Server Component entry.
  *
- * Server Component: fetches the initial overview, tail of the hash chain,
- * and recent audit history, then renders the interactive client
- * <LedgerAdmin/> which owns mutation state and talks to Server Actions.
+ * Authenticated via requireUser() (redirects to /login on miss). Fetches
+ * the initial overview, tail of the hash chain (50 entries), and most
+ * recent 25 audit rows in parallel, then hands off to the interactive
+ * <LedgerAdmin/> client component which owns mutation state and talks
+ * to "use server" actions in ./mutations.ts.
  */
 export default async function AdminLedgerPage() {
   const user = await requireUser();
   if (!user) redirect("/login");
 
-  const [overview, entries, audits] = await Promise.all([
+  const [overview, chainPage, audits] = await Promise.all([
     getTenantAuditOverview(user.id),
-    getLedgerChainEntries(user.id, 50),
+    getLedgerChainEntries(user.id, { limit: 50 }),
     listReconciliationAudits(user.id, 25),
   ]);
 
@@ -46,11 +48,14 @@ export default async function AdminLedgerPage() {
           </p>
         </div>
       </div>
+
       <LedgerAdmin
         initialOverview={overview}
-        initialEntries={entries}
+        initialEntries={chainPage.entries}
+        initialNextCursor={chainPage.nextCursor}
         initialAudits={audits}
       />
+
       <p className="text-xs text-slate-400 dark:text-slate-500 pt-4 border-t border-slate-200/60 dark:border-slate-800/60">
         All reconciliation runs are append-only in{" "}
         <code className="font-mono text-[11px]">reconciliation_audits</code>.

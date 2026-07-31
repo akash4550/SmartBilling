@@ -16,10 +16,16 @@ import { NextResponse } from "next/server";
 import { timingSafeEqual } from "@/lib/api-helpers";
 import { prisma } from "@/lib/prisma";
 import {
+  isReadOnlyMode,
+  READ_ONLY_RETRY_AFTER_SECONDS,
+} from "@/lib/dr-mode";
+import {
   claimDue,
   markDone,
   markRetry,
   markQuarantineHold,
+  isTenantQuarantined,
+  TENANT_QUARANTINED_ERR,
   reapStaleClaims,
   MAX_ATTEMPTS,
   registerDlqAlertHook,
@@ -28,8 +34,6 @@ import {
   processStripeEvent,
   processRazorpayEvent,
   processResendEvent,
-  isTenantQuarantined,
-  TENANT_QUARANTINED_ERR,
 } from "@/lib/webhook-processors";
 import { withService } from "@/lib/service-context";
 
@@ -164,6 +168,25 @@ async function handleRequest(request: Request) {
 
   ensureHooks();
 
+  // Read-Only DR mode: fail fast with 503 + Retry-After without touching
+  // any queues. Pending webhooks stay PENDING; attempts are NOT burned;
+  // the cron scheduler (or provider) will redeliver when we exit DR.
+  if (isReadOnlyMode()) {
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "SmartBill is in Read-Only mode; webhook processing paused.",
+        retryAfterSeconds: READ_ONLY_RETRY_AFTER_SECONDS,
+      },
+      {
+        status: 503,
+        headers: {
+          "Retry-After": String(READ_ONLY_RETRY_AFTER_SECONDS),
+        },
+      }
+    );
+  }
+
   try {
     // Run the worker under service_role (least-privilege, no superuser).
     // All webhook_ingestions writes are performed on `tx` so RLS (which
@@ -180,13 +203,18 @@ async function handleRequest(request: Request) {
 
       for (const row of rows) {
         try {
-          // Quarantine short-circuit: if the tenant this event belongs to
-          // is under ledger quarantine, hold the event PENDING with
-          // lastError='tenant_quarantined' without incrementing attempts
-          // or DLQ counts. Payments are NOT dropped; processing resumes
-          // after operator release.
+          // ---- SINGLE GATEKEEPER: quarantine pre-flight ----
+          // This is the ONLY quarantine check in the pipeline. If the
+          // owning tenant is under ledger quarantine we hold the event
+          // PENDING (attempts NOT burned) and continue. Processors
+          // assume a healthy tenant context and run pure domain/ledger
+          // logic. A defense-in-depth Postgres trigger
+          // (ledger_quarantine_guard → SQLSTATE L0001) is the final
+          // backstop for any race between this check and dispatch;
+          // such throws are caught below and routed to
+          // markQuarantineHold() as well.
           const uid = await tenantForWebhook(row);
-          if (uid && (await isTenantQuarantined(uid))) {
+          if (uid && (await isTenantQuarantined(uid, tx))) {
             await markQuarantineHold(row.id, tx);
             quarantined++;
             continue;
@@ -208,10 +236,12 @@ async function handleRequest(request: Request) {
           await markDone(row.id, tx);
           succeeded++;
         } catch (err) {
-          // If processor threw because the tenant is quarantined (race
-          // between lookup and dispatch), hold instead of failing.
+          // Defense-in-depth: if the PG quarantine trigger fired
+          // between our pre-flight and the dispatch (L0001), or any
+          // downstream code surfaced the sentinel, hold the row
+          // instead of counting it as a failure / DLQ.
           const msg = err instanceof Error ? err.message : String(err);
-          if (msg === TENANT_QUARANTINED_ERR || /Ledger is quarantined|SQLSTATE.*L0001/i.test(msg)) {
+          if (msg === TENANT_QUARANTINED_ERR || /Ledger is quarantined|SQLSTATE.*L0001|L0001/i.test(msg)) {
             await markQuarantineHold(row.id, tx);
             quarantined++;
             continue;

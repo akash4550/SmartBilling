@@ -6,37 +6,33 @@
  * marking invoices PAID, logging payment failures, releasing expired
  * checkout sessions, writing email-activity events, etc.
  *
- * These are deliberately free of signature verification (the edge
- * route already verified before ingesting; the worker just executes).
+ * Contract / seam contract:
+ *   - Signature verification (Stripe constructEvent / Razorpay
+ *     x-razorpay-signature / Resend) is performed by the EDGE route
+ *     BEFORE the event is ingested into webhook_ingestions. Processors
+ *     do not re-verify.
+ *   - Quarantine gating is the SOLE responsibility of the worker in
+ *     src/app/api/cron/process-webhooks/route.ts, via
+ *     isTenantQuarantined() from @/lib/webhook-ingestion. Processors
+ *     assume a healthy tenant context and execute pure domain/ledger
+ *     logic. The Postgres ledger_quarantine_guard trigger (SQLSTATE
+ *     L0001) remains as defense-in-depth; any such error is caught by
+ *     the worker loop and routed to markQuarantineHold().
+ *   - DLQ backoff / poison-pill classification is owned by
+ *     markRetry() in @/lib/webhook-ingestion. Processors simply throw
+ *     on unexpected errors; they do not manage retries themselves.
+ *   - JSON.parse failures on rawBody are treated as poison pills by
+ *     classifyError() upstream and never reach a processor.
  */
 import { prisma } from "@/lib/prisma";
 import { markInvoicePaid, logPaymentFailed } from "@/lib/invoice-helpers";
 import { logActivity } from "@/lib/activity";
 import type Stripe from "stripe";
 
-/**
- * Returns true if the tenant (invoice owner) is under ledger quarantine.
- * When true, webhook processing should be SKIPPED for this event — the
- * caller leaves the webhook_ingestion row PENDING with lastError set to
- * 'tenant_quarantined' so no customer payment is lost; processing resumes
- * after operator release.
- */
-export async function isTenantQuarantined(userId: string): Promise<boolean> {
-  const u = await prisma.user.findUnique({
-    where: { id: userId },
-    select: { ledgerQuarantinedAt: true },
-  });
-  return !!u?.ledgerQuarantinedAt;
-}
-
-export const TENANT_QUARANTINED_ERR = "tenant_quarantined";
-
 // ---------------------------- STRIPE ----------------------------
 
 /**
  * Top-level Stripe dispatcher. Parses the raw body and routes by event.type.
- * This is the same logic that used to live in the synchronous route handler,
- * except we no longer do signature verification here.
  */
 export async function processStripeEvent(rawBody: string) {
   const event = JSON.parse(rawBody) as Stripe.Event;

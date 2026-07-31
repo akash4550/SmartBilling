@@ -26,13 +26,13 @@
  */
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
+import { ServiceContextError } from "@/lib/errors";
 
-export class ServiceContextError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "ServiceContextError";
-  }
-}
+// Re-export for backwards compatibility so existing callers that
+// `import { ServiceContextError } from "@/lib/service-context"` keep
+// working. The canonical class lives in @/lib/errors so instanceof
+// checks across modules agree on a single prototype.
+export { ServiceContextError };
 
 const SAFE_SERVICE_NAME_RE = /^[a-z][a-z0-9:-]{1,63}$/;
 

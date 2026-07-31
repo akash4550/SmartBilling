@@ -27,31 +27,15 @@
  */
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
+import {
+  TenantIsolationError,
+  LedgerQuarantinedError,
+} from "@/lib/errors";
 
-export class TenantIsolationError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "TenantIsolationError";
-  }
-}
-
-/**
- * Thrown when a mutating call is attempted against a quarantined tenant.
- * Reads (allowQuarantinedRead=true) are permitted so operators can diagnose;
- * writes are refused both here and at the Postgres trigger layer.
- */
-export class LedgerQuarantinedError extends Error {
-  public readonly userId: string;
-  public readonly reason: string | null;
-  constructor(userId: string, reason: string | null) {
-    super(
-      `Ledger quarantined for tenant ${userId} (reason=${reason ?? "unspecified"}). Writes blocked.`
-    );
-    this.name = "LedgerQuarantinedError";
-    this.userId = userId;
-    this.reason = reason;
-  }
-}
+// Re-export domain errors for backwards compatibility. Existing callers
+// do `import { LedgerQuarantinedError } from "@/lib/tenant"` and rely on
+// `instanceof`; forwarding through @/lib/errors guarantees one prototype.
+export { TenantIsolationError, LedgerQuarantinedError };
 
 /**
  * Allow-list of characters for the userId before interpolation into SET LOCAL.

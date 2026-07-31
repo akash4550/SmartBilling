@@ -1,0 +1,193 @@
+# =============================================================================
+# SmartBill — Production Readiness CI
+# -----------------------------------------------------------------------------
+# Proves the Automated Ledger Drift & Integrity Reconciler compiles, builds,
+# and passes integration tests against a *real* PostgreSQL 17 instance.
+#
+# Gate order (strict):
+#   1. npm ci                              — deterministic install
+#   2. prisma generate                     — generate @prisma/client before tsc
+#   3. prisma db push                      — schema to Postgres service
+#   4. psql: rls-setup / service-role / ledger / reconciler SQL (kernel)
+#   5. tsc --noEmit                        — strict type check
+#   6. next build                          — production bundle (dynamic routes)
+#   7. vitest src/lib/reconciler.test.ts  — 5 real-DB invariants (single-fork)
+#
+# Concurrency: rapid pushes to the same ref cancel the superseded run so we
+# never burn CI minutes on stale commits.
+# =============================================================================
+
+name: production-readiness
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  readiness:
+    name: Build, typecheck & DB integration
+    runs-on: ubuntu-latest
+
+    # -----------------------------------------------------------------
+    # PostgreSQL 17 service container (mirrors production PG 17 cluster)
+    # Credentials / DB name per spec. Healthcheck uses pg_isready against
+    # the actual test database (smartbill_test) so the workflow doesn't
+    # race against Postgres boot.
+    # -----------------------------------------------------------------
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: smartbill
+          POSTGRES_PASSWORD: secretpassword
+          POSTGRES_DB: smartbill_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U smartbill -d smartbill_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+          --health-start-period 5s
+
+    env:
+      # Per-spec DATABASE_URL. The superuser role matches POSTGRES_USER.
+      DATABASE_URL: "postgresql://smartbill:secretpassword@localhost:5432/smartbill_test?schema=public"
+      PGUSER: smartbill
+      PGPASSWORD: secretpassword
+      PGDATABASE: smartbill_test
+      PGHOST: localhost
+      PGPORT: "5432"
+      # Dummy-but-valid values so next build and tsc don't blow up on
+      # missing env; none of these secrets are exercised by build-time
+      # or vitest code beyond static validation.
+      NODE_ENV: "test"
+      AUTH_SECRET: "ci-auth-secret-please-rotate-32-bytes-min!!"
+      CRON_SECRET: "test-cron-secret-32-bytes-long!!"
+      ADMIN_EMAIL: "ci@smartbill.test"
+      ADMIN_PASSWORD: "ci-password-argoned-locally"
+      NEXT_PUBLIC_SITE_URL: "http://localhost:3000"
+      RESEND_API_KEY: "re_ci_dummy"
+      FROM_EMAIL: "ci@smartbill.test"
+      STRIPE_SECRET_KEY: "sk_test_ci"
+      STRIPE_WEBHOOK_SECRET: "whsec_ci"
+      RAZORPAY_KEY_ID: "rzp_test_ci"
+      RAZORPAY_KEY_SECRET: "ci"
+      RAZORPAY_WEBHOOK_SECRET: "whsec_ci"
+      OPENAI_API_KEY: "sk-ci"
+      # Upstash intentionally empty → CI exercises the in-memory limiter
+      # fallback path (which is what most single-instance deploys use).
+      UPSTASH_REDIS_REST_URL: ""
+      UPSTASH_REDIS_REST_TOKEN: ""
+
+    steps:
+      # -------------------------------------------------------------------
+      # Checkout & toolchain
+      # -------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20.x (with npm cache)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.x"
+          cache: "npm"
+
+      # The DB runs in a sidecar container; the runner host needs its own
+      # psql client to apply the kernel SQL layer (rls-setup, service-role,
+      # ledger, reconciler). Install the matching v17 client from the
+      # postgres apt repo to avoid wire-protocol skew.
+      - name: Install PostgreSQL 17 client (psql)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends postgresql-client-17
+          psql --version
+
+      # -------------------------------------------------------------------
+      # Step 1: deterministic dependency install
+      # -------------------------------------------------------------------
+      - name: Install dependencies (npm ci)
+        run: npm ci
+
+      # -------------------------------------------------------------------
+      # Generate Prisma Client (Step 3 in the spec ordering, but executed
+      # early so `tsc --noEmit` can resolve @prisma/client types for any
+      # file that imports them). The package.json `postinstall` hook also
+      # runs `prisma generate`; running it explicitly keeps the step
+      # visible and makes the CI log easier to debug on failure.
+      # -------------------------------------------------------------------
+      - name: Generate Prisma Client
+        run: npx prisma generate
+
+      # -------------------------------------------------------------------
+      # Step 2a: push Prisma schema → service container. Uses
+      # --accept-data-loss because the test DB is freshly-booted (no data
+      # to preserve) and --skip-generate since we already generated.
+      # -------------------------------------------------------------------
+      - name: Push Prisma schema (prisma db push)
+        run: npx prisma db push --skip-generate --accept-data-loss
+
+      # -------------------------------------------------------------------
+      # Step 2b: apply the SQL kernel layers in the exact order required
+      # by README/operator playbook: RLS → service_role → ledger trigger
+      # → reconciler (quarantine guard + audit indexes).
+      #
+      # NOTE: The shipped SQL files contain legacy `GRANT CONNECT ON
+      # DATABASE smart_billing` for the dev/seed database name. In CI we
+      # use a dedicated database (`smartbill_test`) per the CI spec, so we
+      # pipe each SQL file through a surgical sed that redirects those
+      # CONNECT grants to the active CI database without touching source.
+      # All other grants (schema/table/sequence) are database-agnostic.
+      # -------------------------------------------------------------------
+      - name: Apply Row-Level Security (rls-setup.sql)
+        run: |
+          set -euo pipefail
+          sed "s/ON DATABASE smart_billing/ON DATABASE smartbill_test/g" \
+            prisma/rls-setup.sql \
+            | psql -v ON_ERROR_STOP=1 -f -
+
+      - name: Apply service_role grants (service-role.sql)
+        run: |
+          set -euo pipefail
+          sed "s/ON DATABASE smart_billing/ON DATABASE smartbill_test/g" \
+            prisma/service-role.sql \
+            | psql -v ON_ERROR_STOP=1 -f -
+
+      - name: Apply ledger balance trigger (ledger.sql)
+        run: |
+          set -euo pipefail
+          psql -v ON_ERROR_STOP=1 -f prisma/ledger.sql
+
+      - name: Apply reconciler kernel (reconciler.sql)
+        run: |
+          set -euo pipefail
+          psql -v ON_ERROR_STOP=1 -f prisma/reconciler.sql
+
+      # -------------------------------------------------------------------
+      # Step 4: strict TypeScript type check (zero errors required)
+      # -------------------------------------------------------------------
+      - name: TypeScript strict check (tsc --noEmit)
+        run: npx tsc --noEmit
+
+      # -------------------------------------------------------------------
+      # Step 5: production Next.js build gate — verifies that /admin/ledger
+      # and all cron / admin API route handlers compile as dynamic 'ƒ'
+      # routes and that no server-only module leaks into client bundles.
+      # -------------------------------------------------------------------
+      - name: Production build (next build)
+        run: npx next build
+
+      # -------------------------------------------------------------------
+      # Step 6: real-DB Vitest integration suite. vitest.config.ts pins
+      # pool: "forks" with singleFork: true so tests run serially against
+      # the same Postgres service without advisory-lock contention.
+      # -------------------------------------------------------------------
+      - name: Vitest — reconciler integration suite
+        run: npm test -- src/lib/reconciler.test.ts
