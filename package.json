@@ -9,6 +9,7 @@
     "lint": "eslint",
     "db:seed": "npx prisma db seed",
     "db:reset": "prisma migrate reset --force && npm run db:seed",
+    "db:setup": "prisma db push --accept-data-loss && prisma generate && psql \"$DATABASE_URL\" -f prisma/rls-setup.sql && psql \"$DATABASE_URL\" -f prisma/service-role.sql && psql \"$DATABASE_URL\" -f prisma/ledger.sql && psql \"$DATABASE_URL\" -f prisma/reconciler.sql && npm run db:seed",
     "postinstall": "prisma generate"
   },
   "prisma": {

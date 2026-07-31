@@ -1,6 +1,8 @@
 "use client";
 
 import * as React from "react";
+import { toast } from "sonner";
+import { useRouter } from "next/navigation";
 import {
   ShieldAlert,
   ShieldCheck,
@@ -40,6 +42,7 @@ import {
   type TenantAuditOverview,
   type AuditRunSummary,
   type LedgerChainEntry,
+  getLedgerChainEntries,
 } from "../actions";
 import {
   triggerTenantReconcileAction,
@@ -542,7 +545,17 @@ function SideChip({ side }: { side: "DEBIT" | "CREDIT" | string }) {
   return <Badge variant="warning" className="font-mono text-[10px] px-1.5 py-0">Cr</Badge>;
 }
 
-function ChainExplorer({ entries }: { entries: LedgerChainEntry[] }) {
+function ChainExplorer({
+  entries,
+  hasMore,
+  loadingMore,
+  onLoadMore,
+}: {
+  entries: LedgerChainEntry[];
+  hasMore: boolean;
+  loadingMore: boolean;
+  onLoadMore: () => void;
+}) {
   const [expanded, setExpanded] = React.useState<Set<string>>(new Set());
   function toggle(id: string) {
     setExpanded((s) => {
@@ -659,6 +672,24 @@ function ChainExplorer({ entries }: { entries: LedgerChainEntry[] }) {
             </tbody>
           </table>
         </div>
+        {hasMore && (
+          <div className="border-t border-slate-100 dark:border-slate-800/70 px-4 py-3 flex items-center justify-center">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={onLoadMore}
+              disabled={loadingMore}
+              className="gap-1.5"
+            >
+              {loadingMore ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <ChevronRight className="h-4 w-4 rotate-90" />
+              )}
+              {loadingMore ? "Loading…" : "Load older entries"}
+            </Button>
+          </div>
+        )}
       </CardContent>
     </Card>
   );
@@ -760,22 +791,78 @@ function AuditHistory({ audits }: { audits: AuditRunSummary[] }) {
 // MAIN CLIENT COMPONENT
 // ============================================================
 
+const CHAIN_PAGE_SIZE = 50;
+const CHAIN_MAX = 200;
+
 export default function LedgerAdmin(props: {
   initialOverview: TenantAuditOverview;
   initialEntries: LedgerChainEntry[];
   initialAudits: AuditRunSummary[];
 }) {
+  const router = useRouter();
   const [overview, setOverview] = React.useState<TenantAuditOverview>(props.initialOverview);
   const [entries, setEntries] = React.useState<LedgerChainEntry[]>(props.initialEntries);
   const [audits, setAudits] = React.useState<AuditRunSummary[]>(props.initialAudits);
   const [running, setRunning] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
-  const prevEntriesRef = React.useRef<number | null>(null);
+  const [loadingMore, setLoadingMore] = React.useState(false);
+  const [chainLimit, setChainLimit] = React.useState<number>(CHAIN_PAGE_SIZE);
+
+  // Track the last audit id we showed results for so we can selectively
+  // show a toast only for mutations the user triggered (not first paint).
+  const lastAuditIdRef = React.useRef<string | null>(
+    props.initialOverview.latestAudit?.id ?? null
+  );
+
+  // Refresh the chain list from the server after a mutation. Resets to
+  // the first page so the newest entries (including any backfilled rows)
+  // appear at the top.
+  async function refreshChain() {
+    try {
+      const fresh = await getLedgerChainEntries(overview.tenantId, chainLimit);
+      setEntries(fresh);
+    } catch (e) {
+      // Non-fatal: stale entries are better than a hard crash. The audit
+      // history still reflects truth.
+      console.error("[admin/ledger] refreshChain failed:", e);
+    }
+  }
+
+  async function loadMore() {
+    const next = Math.min(chainLimit + CHAIN_PAGE_SIZE, CHAIN_MAX);
+    if (next === chainLimit) return;
+    setLoadingMore(true);
+    try {
+      const fresh = await getLedgerChainEntries(overview.tenantId, next);
+      setEntries(fresh);
+      setChainLimit(next);
+    } finally {
+      setLoadingMore(false);
+    }
+  }
+
+  function afterMutation(label: string) {
+    // Soft RSC refresh so server-rendered data stays consistent, then
+    // refresh the chain client-side to pick up new entries immediately.
+    router.refresh();
+    void refreshChain();
+    if (lastAuditIdRef.current && overview.latestAudit &&
+        lastAuditIdRef.current !== overview.latestAudit.id) {
+      toast.success(label, {
+        description: `Status: ${overview.latestAudit.status} · scanned ${overview.latestAudit.entriesScanned} rows`,
+      });
+      lastAuditIdRef.current = overview.latestAudit.id;
+    }
+  }
 
   // SWR-free: all mutations return hydrated state via `overview` + `recentAudits`.
   function applyReconcile(r: ReconcileActionResult | BackfillActionResult) {
+    let label = "Reconciliation complete";
+    if (r.audit?.autoRemediated) label = "Auto-backfill completed";
     if (r.overview) setOverview(r.overview);
     if (r.recentAudits?.length) setAudits(r.recentAudits);
+    // Defer toast/refresh until state commit.
+    setTimeout(() => afterMutation(label), 0);
   }
 
   async function runReconcile() {
@@ -785,6 +872,7 @@ export default function LedgerAdmin(props: {
       const r = await triggerTenantReconcileAction(overview.tenantId);
       if (!r.ok) {
         setError(r.error ?? "Reconcile failed.");
+        toast.error("Reconcile failed", { description: r.error ?? undefined });
       } else {
         applyReconcile(r);
       }
@@ -800,6 +888,7 @@ export default function LedgerAdmin(props: {
       const r = await backfillTenantAction(overview.tenantId);
       if (!r.ok) {
         setError(r.error ?? "Backfill failed.");
+        toast.error("Backfill failed", { description: r.error ?? undefined });
       } else {
         applyReconcile(r);
       }
@@ -813,29 +902,22 @@ export default function LedgerAdmin(props: {
   ) {
     if (r.overview) setOverview(r.overview);
     if (r.recentAudits?.length) setAudits(r.recentAudits);
+    const isRelease = "released" in r;
+    const label = isRelease
+      ? (r.forced ? "Quarantine force-released" : "Quarantine released")
+      : "Ledger quarantined";
+    setTimeout(() => {
+      router.refresh();
+      void refreshChain();
+      toast[label === "Ledger quarantined" ? "error" : "success"](label, {
+        description: isRelease && r.audit
+          ? `Reconcile status: ${r.audit.status}`
+          : "Financial writes are now blocked.",
+      });
+    }, 0);
   }
 
-  // After backfill or when a reconcile auto-remediated, new ledger entries
-  // may exist — the server actions already return a refreshed
-  // `overview` + `recentAudits`, but the chain explorer displays the
-  // initially-fetched entry list. The simplest correct behaviour is to
-  // do a soft router refresh so the RSC re-fetches fresh chain data.
-  // We only trigger this when the user has performed a mutation (not on
-  // initial mount) and when entriesScanned changed or autoRemediated.
-  React.useEffect(() => {
-    if (running) return;
-    if (!overview.latestAudit) return;
-    const prev = prevEntriesRef.current;
-    if (prev && overview.latestAudit.entriesScanned > prev) {
-      // Soft reload: Next.js router.refresh() would re-run RSC without
-      // losing client state — but our RSC tree is a direct child of the
-      // page, so window.location.reload is simplest and guaranteed to
-      // reflect new ledger rows. Acceptable for an operator console.
-      window.location.reload();
-    }
-    prevEntriesRef.current = overview.latestAudit.entriesScanned;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [running, overview.latestAudit?.id]);
+  const hasMore = entries.length >= chainLimit && chainLimit < CHAIN_MAX;
 
   return (
     <div className="space-y-6">
@@ -850,7 +932,12 @@ export default function LedgerAdmin(props: {
 
       <div className="grid gap-6 lg:grid-cols-5">
         <div className="lg:col-span-3">
-          <ChainExplorer entries={entries} />
+          <ChainExplorer
+            entries={entries}
+            hasMore={hasMore}
+            loadingMore={loadingMore}
+            onLoadMore={loadMore}
+          />
         </div>
         <div className="lg:col-span-2">
           <AuditHistory audits={audits} />

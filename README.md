@@ -415,3 +415,75 @@ The webhook DLQ is now an operational subsystem, not a graveyard:
 - **Operator controls.** `POST /api/admin/dlq/:id?action=redrive[&force=1]` replays one row (force=1 bypasses the POISON check for an operator-confirmed replay); `POST /api/admin/dlq/:id?action=resolve` marks a row resolved with an operator note. `GET /api/admin/dlq` lists rows. All endpoints authenticate via `CRON_SECRET`.
 - **Alerting.** `registerDlqAlertHook(hook)` lets any module subscribe to DLQ/POISON transitions. The default hook emits a structured `[dlq-alert]` error log line (consumed by Vercel Log Drains / Datadog / whatever log shipper you use). Adding Slack/PagerDuty/Resend notifications is a one-line hook registration.
 - Idempotency: replaying an already-DONE/PENDING/PROCESSING row returns `{ ok: false, reason: 'already_*' }`. Rows that have been replayed and fail again naturally re-enter the retry/DLQ path up to the redrive cap.
+
+---
+
+## 🛡️ Ledger Audit Console (Admin)
+
+SmartBill ships with an internal **Admin Audit Console** at `/admin/ledger`
+(visible to signed-in users via the User Menu → "Ledger Audit Console"):
+
+- **Section A — Health Banner.** Green/amber/red/slate status derived from the
+  latest reconciliation run. Tiles show Open Receivables, Cash (ledger), Paid
+  Invoices Σ, and Expenses Σ with Δ vs. read-model aggregates. Buttons:
+  "Run Reconciler Now", "Backfill & Re-verify", and either "Release
+  Quarantine…" (mandatory audit note + optional Force) or "Quarantine…"
+  depending on state.
+- **Section B — Hash-Chain Explorer.** Newest-first table of the SHA-256
+  chained double-entry ledger with Dr/Cr side chips, copy-hash button, and
+  a click-to-expand row that shows the prev ↓ entry hash link and full
+  metadata (eventId, invoice/expense ids, currency, timestamp, note).
+  "Load older entries" paginates back to 200 rows.
+- **Section C — Audit History.** Collapsible list of every reconciliation
+  run with status badges, severity pills (crit/high/med), scanned-row
+  count, duration, and expanded expected/actual/Δ breakdown for each
+  discrepancy.
+
+### How reconciliation works
+
+Two sweeps per tenant, every 15 min (incremental) and at 03:00 IST (full):
+
+- **Sweep A** — Streams the ledger 500 rows at a time, verifies each SHA-256
+  chain link, checks for entry-index gaps, and asserts ΣD = ΣC per eventId.
+- **Sweep B** — SQL-pushed-down balance cross-checks:
+  - `ACCOUNTS_RECEIVABLE` signed balance vs. Σ PENDING invoice totals.
+  - `CASH` signed balance vs. per-event CASH aggregate (handles refunds and
+    void-payment reversals correctly — no false positives after a
+    `PAYMENT_REVERSED`).
+  - `EXPENSES` signed balance vs. Σ expenses table.
+  - MEDIUM-only Revenue/Tax parity (scoped to issuance/void events).
+
+One idempotent auto-backfill runs for AR/CASH/EXPENSE mismatches when there
+is no structural hash/gap failure; CRITICAL or residual HIGH drift flips
+`users.ledgerQuarantinedAt` and **blocks all financial writes** via three
+defense layers: `assertNotQuarantined()` before the chain lock,
+`withTenant()` pre-tx check, and a `BEFORE INSERT OR UPDATE OR DELETE`
+trigger raising SQLSTATE `L0001` on `invoices`, `invoice_items`,
+`expenses`, `ledger_entries`.
+
+Webhook payments for quarantined tenants are held (not DLQ'd) and resume
+processing after release.
+
+### API endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET/POST | `/api/cron/reconcile?mode=incremental\|full\|single&tenantId=…` | Cron entry point (Bearer `CRON_SECRET`). |
+| GET/POST | `/api/cron/reconcile-ledger` | Alias. |
+| GET | `/api/admin/ledger/:tenantId/quarantine` | Current quarantine state + latest audit. |
+| POST | `/api/admin/ledger/:tenantId/quarantine` | `{action: quarantine\|release\|backfill\|reconcile, reason, force?}`. Session callers are scoped to their own tenant; service callers use Bearer `CRON_SECRET`. Same-origin CSRF check enforced for cookie sessions. |
+| GET | `/api/admin/ledger/:tenantId/audit?limit=N` | Recent audit rows. |
+
+### Setup
+
+After `prisma db push`, apply the RLS, service-role, ledger trigger, and
+reconciler SQL files, then seed. The `npm run db:setup` script chains
+these steps for a fresh database:
+
+```bash
+DATABASE_URL="postgresql://smartbill:smartbill@localhost:5432/smart_billing?schema=public" \
+  npm run db:setup
+```
+
+A production-readiness audit of the full reconciler + UI stack is in
+[`LEDGER_AUDIT_REPORT.md`](./LEDGER_AUDIT_REPORT.md).

@@ -62,11 +62,13 @@ async function handleRequest(request: Request) {
   const tenantId = url.searchParams.get("tenantId");
   const force = url.searchParams.get("force") === "1";
 
+  const SAFE_TENANT_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
   try {
     if (mode === "single") {
-      if (!tenantId) {
+      if (!tenantId || !SAFE_TENANT_RE.test(tenantId)) {
         return NextResponse.json(
-          { error: "tenantId required for mode=single" },
+          { error: "tenantId required for mode=single (safe form: [A-Za-z0-9_-]{1,128})" },
           { status: 400 }
         );
       }

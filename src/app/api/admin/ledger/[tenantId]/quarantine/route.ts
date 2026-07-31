@@ -27,13 +27,20 @@ import {
   operatorBackfill,
   reconcileTenant,
 } from "@/lib/reconciler";
+import { isSameOrigin } from "@/lib/csrf";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const SAFE_TENANT_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
-type OperatorAuth = { ok: boolean; actor: string; tenantId: string | null };
+type OperatorAuth = {
+  ok: boolean;
+  actor: string;
+  tenantId: string | null;
+  /** True when the caller authenticated via CRON_SECRET (service call), false when cookie-authed. */
+  isService: boolean;
+};
 
 /**
  * Authenticate the operator. Two paths:
@@ -47,27 +54,27 @@ async function assertOperator(
 ): Promise<OperatorAuth> {
   // Validate tenantId shape up front (defense-in-depth against SQLi / bad input).
   if (typeof tenantId !== "string" || !SAFE_TENANT_RE.test(tenantId)) {
-    return { ok: false, actor: "", tenantId: null };
+    return { ok: false, actor: "", tenantId: null, isService: false };
   }
   const secret = process.env.CRON_SECRET;
   if (secret) {
     const auth = request.headers.get("authorization") ?? "";
     const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
     if (timingSafeEqual(token, secret)) {
-      return { ok: true, actor: "cron-secret", tenantId };
+      return { ok: true, actor: "cron-secret", tenantId, isService: true };
     }
     const url = new URL(request.url);
     if (timingSafeEqual(url.searchParams.get("secret") ?? "", secret)) {
-      return { ok: true, actor: "cron-secret", tenantId };
+      return { ok: true, actor: "cron-secret", tenantId, isService: true };
     }
   }
   const user = await requireUser();
-  if (!user) return { ok: false, actor: "", tenantId: null };
+  if (!user) return { ok: false, actor: "", tenantId: null, isService: false };
   // Tenant isolation: signed-in users may only operate on their own ledger.
   if (user.id !== tenantId) {
-    return { ok: false, actor: "", tenantId: null };
+    return { ok: false, actor: "", tenantId: null, isService: false };
   }
-  return { ok: true, actor: user.id, tenantId };
+  return { ok: true, actor: user.id, tenantId, isService: false };
 }
 
 type Action = "quarantine" | "release" | "backfill" | "reconcile";
@@ -113,6 +120,12 @@ export async function POST(
   const { tenantId } = await params;
   const authed = await assertOperator(request, tenantId);
   if (!authed.ok) return unauthorized();
+
+  // CSRF: cookie-authed (browser UI) POSTs must carry a same-site Origin.
+  // Cron/secret callers are exempt because they authenticate via bearer.
+  if (!authed.isService && !isSameOrigin(request)) {
+    return NextResponse.json({ error: "Cross-origin request blocked" }, { status: 403 });
+  }
 
   const body = (await request.json().catch(() => ({}))) as {
     action?: unknown;
