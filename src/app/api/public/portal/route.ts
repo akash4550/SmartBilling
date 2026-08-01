@@ -13,7 +13,7 @@ import { prisma } from "@/lib/prisma";
 import { stripeConfigured } from "@/lib/stripe";
 import { razorpayConfigured, getRazorpayKeyId } from "@/lib/razorpay";
 import { DEFAULT_BRAND_COLOR } from "@/lib/branding";
-import { rateLimit, requestKey } from "@/lib/rate-limit";
+import { checkRateLimit, requestKey } from "@/lib/rate-limiter";
 
 export const runtime = "nodejs";
 
@@ -23,14 +23,14 @@ export async function GET(request: Request) {
 
   // Rate limit: 60/min/IP — prevents brute-force token guessing while letting
   // legitimate clients refresh freely.
-  const rl = rateLimit(requestKey(request, "portal"), {
+  const rl = await checkRateLimit(requestKey(request, "portal"), {
     namespace: "public-portal",
     limit: 60,
     windowSec: 60,
   });
   if (!rl.allowed) {
-    return NextResponse.json({ error: "Too many requests" }, { status: 429 });
-  }
+      return rl.toResponse('Too many requests.');
+    }
 
   if (!token || typeof token !== "string" || token.length < 6) {
     return NextResponse.json({ error: "Invalid portal link" }, { status: 400 });

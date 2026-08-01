@@ -2,10 +2,10 @@
  * Unified sliding-window rate limiter (server-only).
  *
  * This module is the single canonical rate-limit implementation for
- * SmartBill. It replaces the legacy `src/lib/rate-limit.ts` +
- * `src/lib/rate-limit-redis.ts` pair, which had grown duplicated
- * Upstash pipelines, separate in-memory Maps, and no shared eviction /
- * error-handling contract.
+ * SmartBill. It supersedes the earlier duplicate implementations
+ * (synchronous in-memory + Redis-only variants) and provides a shared
+ * eviction, error-handling, and HTTP-response contract. Any new code
+ * MUST import from this module.
  *
  * Design
  * ------
@@ -29,7 +29,7 @@
  * Two call shapes are supported:
  *
  *  1. Server Actions / programmatic guards:
- *       await assertRateLimit(key, cfg?)  → throws RateLimitExceeded
+ *       await assertRateLimit(key, cfg?)  → throws RateLimitExceededError
  *   For the admin-ledger mutations, a pre-configured
  *   `assertMutationRateLimit(userId)` helper is preserved.
  *
@@ -39,17 +39,20 @@
  *
  * NOTE: This module reads `process.env` at the top of the call stack
  * and must never be imported from a "use client" bundle. Type-only
- * imports are safe.
+ * imports are safe. Enforced at build time by `import "server-only"`.
  */
+
+import "server-only";
 
 import { NextResponse } from "next/server";
 
-import { RateLimitExceeded as RateLimitExceededCls } from "./errors";
+import { RateLimitExceededError } from "./errors";
 
-// Re-export the canonical RateLimitExceeded so callers can `instanceof`
-// it from either import path without risk of prototype mismatch.
-export const RateLimitExceeded = RateLimitExceededCls;
-export type { RateLimitExceeded as RateLimitExceededType };
+// Re-export the canonical error so callers can `instanceof` it from
+// this import path without risk of prototype mismatch. The class is
+// defined once in @/lib/errors to keep instanceof reliable across the
+// entire codebase.
+export { RateLimitExceededError };
 
 // ============================================================
 // TYPES / CONSTANTS
@@ -388,7 +391,7 @@ export async function checkRateLimit(
 
 /**
  * Assert-style guard used by Server Actions. Returns normally on
- * success; throws a `RateLimitExceeded` Error (with retryAfterMs)
+ * success; throws a `RateLimitExceededError` (with retryAfterMs)
  * when the budget is exhausted.
  */
 export async function assertRateLimit(
@@ -398,7 +401,7 @@ export async function assertRateLimit(
 ): Promise<void> {
   const rl = await checkRateLimit(key, cfg);
   if (!rl.allowed) {
-    throw new RateLimitExceeded(userMessage, rl.retryAfterMs, cfg.limit, cfg.windowSec);
+    throw new RateLimitExceededError(userMessage, rl.retryAfterMs, cfg.limit, cfg.windowSec);
   }
 }
 

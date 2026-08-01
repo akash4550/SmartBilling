@@ -8,7 +8,7 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-import { rateLimit, requestKey } from "@/lib/rate-limit";
+import { checkRateLimit, requestKey } from "@/lib/rate-limiter";
 
 export const runtime = "nodejs";
 
@@ -50,14 +50,14 @@ export async function GET(request: Request) {
   }
   const userId = session.user.id;
 
-  const rl = rateLimit(requestKey(request, `dash-act:${userId}`), {
+  const rl = await checkRateLimit(requestKey(request, `dash-act:${userId}`), {
     namespace: "dash-activity",
     limit: 60,
     windowSec: 60,
   });
   if (!rl.allowed) {
-    return NextResponse.json({ error: "Too many requests" }, { status: 429 });
-  }
+      return rl.toResponse('Too many requests.');
+    }
 
   const url = new URL(request.url);
   const limit = Math.min(50, Math.max(1, Number(url.searchParams.get("limit") || "10")));

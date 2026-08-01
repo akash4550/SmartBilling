@@ -82,6 +82,48 @@ import {
 // Tab-wrap / Escape / return-focus behavior across the product.
 
 // ============================================================
+// Double-click / abort hardening helpers
+// ============================================================
+//
+// All mutation entry points (banner buttons and dialog submit buttons)
+// apply two layered defenses against double-submit and stale-response
+// races:
+//
+//   1. Synchronous DOM lock — `if (e.currentTarget.disabled) return;
+//      e.currentTarget.disabled = true;` runs in the FIRST tick of the
+//      click handler, BEFORE any `await` and BEFORE React schedules the
+//      next render. This closes the window between the native click
+//      dispatch and React's commit where the React-level
+//      `disabled={isBusy}` prop takes effect — so a rapid second click
+//      (double-click, Enter+Space, auto-click tools, synthesized events
+//      from assistive tech) is rejected at the DOM level before it can
+//      start a duplicate Server Action.
+//
+//   2. AbortController — each mutation owns an AbortController held in
+//      a ref. When the operator fires another mutation (or closes a
+//      dialog mid-flight), any prior in-flight call is aborted. Server
+//      Actions do not accept an AbortSignal themselves (the POST is
+//      already on the wire), so we do NOT attempt to cancel the network
+//      request; instead, every state update, toast, and optimistic
+//      clearing is gated on `signal.aborted === false`, so a stale
+//      response from a superseded click cannot clobber newer state or
+//      surface a confusing error toast. The controller is also aborted
+//      on unmount to silence updates after the dialog closes / route
+//      changes.
+//
+// React-level guards (`isBusy`, `disabled={submitting}`) remain in place
+// as a third layer and as the source of truth for accessible
+// aria-busy / cursor styling; the DOM lock + AbortController are the
+// belt-and-braces for races React cannot see.
+
+function isAbortError(err: unknown): boolean {
+  return (
+    (typeof DOMException !== "undefined" && err instanceof DOMException && err.name === "AbortError") ||
+    (err instanceof Error && err.name === "AbortError")
+  );
+}
+
+// ============================================================
 // STATUS / HEALTH
 // ============================================================
 
@@ -318,6 +360,14 @@ function SideChip({ side }: { side: "DEBIT" | "CREDIT" | string }) {
 // association and focus trap without modifying the shared UI kit.
 // The Dialog primitive still applies body scroll-lock (overflow:hidden)
 // while open, which we want.
+//
+// Each dialog owns its own submit AbortController so that:
+//   - Rapid double-click of the submit button is rejected at the DOM
+//     level (sync lock) and any in-flight request from a prior click
+//     is aborted (its result ignored).
+//   - Closing the dialog mid-submit aborts the pending work so stale
+//     state updates / toasts never fire after the user has dismissed
+//     the panel.
 
 const NOTE_MAX = 500;
 
@@ -351,6 +401,12 @@ function ReleaseDialog({
   const [submitting, setSubmitting] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
 
+  // Per-dialog submit abort controller. Aborted on close, on a newer
+  // submit, and on unmount so that a response arriving after the
+  // dialog is gone cannot fire setState on an unmounted component or
+  // surface a misleading toast.
+  const submitAbortRef = React.useRef<AbortController | null>(null);
+
   const titleId = React.useId();
   const descId = React.useId();
   const noteRef = React.useRef<HTMLTextAreaElement | null>(null);
@@ -360,44 +416,93 @@ function ReleaseDialog({
     initialFocusRef: noteRef,
   });
 
+  // Abort any in-flight submit on unmount.
+  React.useEffect(() => {
+    return () => {
+      submitAbortRef.current?.abort();
+      submitAbortRef.current = null;
+    };
+  }, []);
+
+  // When the dialog closes, abort in-flight submits (if any) and reset.
+  const handleOpenChange = React.useCallback((v: boolean) => {
+    setOpen(v);
+    if (!v) {
+      submitAbortRef.current?.abort();
+      submitAbortRef.current = null;
+      setNote("");
+      setForce(false);
+      setError(null);
+    }
+  }, []);
+
   const trimmed = note.trim();
   const canSubmit = trimmed.length > 0 && trimmed.length <= NOTE_MAX && !submitting;
 
-  function resetForm() {
-    setNote("");
-    setForce(false);
-    setError(null);
-  }
+  const onSubmit = React.useCallback(
+    async (e: React.MouseEvent<HTMLButtonElement>) => {
+      // ---- Layer 1: synchronous DOM lock ----
+      // Defeat double-click before any async work or React render.
+      if (e.currentTarget.disabled) return;
+      e.currentTarget.disabled = true;
 
-  async function onSubmit() {
-    if (!canSubmit) return;
-    setSubmitting(true);
-    setError(null);
-    // Optimistic UI: tell the parent we've started so HealthBanner
-    // can flip to "RELEASING…" before the server round-trip completes.
-    onStart?.();
-    try {
-      const res = await releaseTenantQuarantineAction(overview.tenantId, trimmed, {
-        force,
-      });
-      if (!res.ok) {
-        setError(res.error ?? "Release failed.");
-        // The dialog stays open so the operator can read the error and
-        // retry — clear the optimistic override so the banner returns
-        // to the authoritative server state.
-        onSettle?.();
+      if (!canSubmit) {
+        // Shouldn't happen (button is disabled by React), but be defensive.
+        e.currentTarget.disabled = false;
         return;
       }
-      setOpen(false);
-      resetForm();
-      onReleased(res);
-    } finally {
-      setSubmitting(false);
-    }
-  }
+
+      // ---- Layer 2: abort prior in-flight submit (if any) ----
+      submitAbortRef.current?.abort();
+      const ac = new AbortController();
+      submitAbortRef.current = ac;
+      const signal = ac.signal;
+
+      setSubmitting(true);
+      setError(null);
+      // Optimistic UI: tell the parent we've started so HealthBanner
+      // can flip to "RELEASING…" before the server round-trip completes.
+      onStart?.();
+
+      try {
+        const res = await releaseTenantQuarantineAction(
+          overview.tenantId,
+          trimmed,
+          { force }
+        );
+        if (signal.aborted) return; // superseded / closed
+
+        if (!res.ok) {
+          setError(res.error ?? "Release failed.");
+          // The dialog stays open so the operator can read the error and
+          // retry — clear the optimistic override so the banner returns
+          // to the authoritative server state.
+          onSettle?.();
+          return;
+        }
+        // Success: close before notifying parent so unmount aborts any
+        // stale timers but the response is already in hand.
+        submitAbortRef.current = null;
+        setOpen(false);
+        setNote("");
+        setForce(false);
+        setError(null);
+        onReleased(res);
+      } catch (err) {
+        if (signal.aborted || isAbortError(err)) return;
+        setError(err instanceof Error ? err.message : "Release failed.");
+        onSettle?.();
+      } finally {
+        if (!signal.aborted) {
+          setSubmitting(false);
+        }
+      }
+    },
+    [canSubmit, force, onReleased, onSettle, onStart, overview.tenantId, trimmed]
+  );
 
   return (
-    <Dialog open={open} onOpenChange={(v) => { setOpen(v); if (!v) resetForm(); }}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogTrigger asChild>
         <Button
           variant="default"
@@ -556,6 +661,8 @@ function QuarantineDialog({
   const [submitting, setSubmitting] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
 
+  const submitAbortRef = React.useRef<AbortController | null>(null);
+
   const titleId = React.useId();
   const descId = React.useId();
   const noteRef = React.useRef<HTMLTextAreaElement | null>(null);
@@ -565,36 +672,73 @@ function QuarantineDialog({
     initialFocusRef: noteRef,
   });
 
+  React.useEffect(() => {
+    return () => {
+      submitAbortRef.current?.abort();
+      submitAbortRef.current = null;
+    };
+  }, []);
+
+  const handleOpenChange = React.useCallback((v: boolean) => {
+    setOpen(v);
+    if (!v) {
+      submitAbortRef.current?.abort();
+      submitAbortRef.current = null;
+      setNote("");
+      setError(null);
+    }
+  }, []);
+
   const trimmed = note.trim();
   const canSubmit = trimmed.length > 0 && trimmed.length <= NOTE_MAX && !submitting;
 
-  function resetForm() {
-    setNote("");
-    setError(null);
-  }
+  const onSubmit = React.useCallback(
+    async (e: React.MouseEvent<HTMLButtonElement>) => {
+      // Synchronous DOM lock.
+      if (e.currentTarget.disabled) return;
+      e.currentTarget.disabled = true;
 
-  async function onSubmit() {
-    if (!canSubmit) return;
-    setSubmitting(true);
-    setError(null);
-    onStart?.();
-    try {
-      const res = await quarantineTenantAction(overview.tenantId, trimmed);
-      if (!res.ok) {
-        setError(res.error ?? "Quarantine failed.");
-        onSettle?.();
+      if (!canSubmit) {
+        e.currentTarget.disabled = false;
         return;
       }
-      setOpen(false);
-      resetForm();
-      onQuarantined(res);
-    } finally {
-      setSubmitting(false);
-    }
-  }
+
+      submitAbortRef.current?.abort();
+      const ac = new AbortController();
+      submitAbortRef.current = ac;
+      const signal = ac.signal;
+
+      setSubmitting(true);
+      setError(null);
+      onStart?.();
+      try {
+        const res = await quarantineTenantAction(overview.tenantId, trimmed);
+        if (signal.aborted) return;
+        if (!res.ok) {
+          setError(res.error ?? "Quarantine failed.");
+          onSettle?.();
+          return;
+        }
+        submitAbortRef.current = null;
+        setOpen(false);
+        setNote("");
+        setError(null);
+        onQuarantined(res);
+      } catch (err) {
+        if (signal.aborted || isAbortError(err)) return;
+        setError(err instanceof Error ? err.message : "Quarantine failed.");
+        onSettle?.();
+      } finally {
+        if (!signal.aborted) {
+          setSubmitting(false);
+        }
+      }
+    },
+    [canSubmit, onQuarantined, onSettle, onStart, overview.tenantId, trimmed]
+  );
 
   return (
-    <Dialog open={open} onOpenChange={(v) => { setOpen(v); if (!v) resetForm(); }}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogTrigger asChild>
         <Button
           variant="outline"
@@ -719,8 +863,8 @@ function HealthBanner({
   overview: TenantAuditOverview;
   optimisticOp: OptimisticOp;
   latestError: string | null;
-  onReconcile: () => void;
-  onBackfill: () => void;
+  onReconcile: (e: React.MouseEvent<HTMLButtonElement>) => void;
+  onBackfill: (e: React.MouseEvent<HTMLButtonElement>) => void;
   onRelease: (r: ReleaseActionResult | QuarantineActionResult) => void;
   onReleaseStart: () => void;
   onQuarantineStart: () => void;
@@ -773,8 +917,12 @@ function HealthBanner({
   // "working" badge. The server state remains visible in the metrics
   // cards and palette accent bar, so the operator always sees both the
   // current truth and the in-flight intent.
-  const title = optimisticOp ? OPTIMISTIC_META[optimisticOp].label.replace("…", "") : palette.title;
-  const desc = optimisticOp ? OPTIMISTIC_META[optimisticOp].describe : palette.desc;
+  const title = optimisticOp
+    ? OPTIMISTIC_META[optimisticOp].label.replace("…", "")
+    : palette.title;
+  const desc = optimisticOp
+    ? OPTIMISTIC_META[optimisticOp].describe
+    : palette.desc;
 
   // Δ = ledger (ground truth) − expected (read model). 0 → reconciled (green),
   // non-zero → drift (red). All arithmetic is BigInt over string paise.
@@ -1281,9 +1429,7 @@ function PaiseDelta({
     );
   }
   const tone =
-    d < BigInt(0)
-      ? "text-red-600 dark:text-red-400"
-      : "text-red-600 dark:text-red-400";
+    d < BigInt(0) ? "text-red-600 dark:text-red-400" : "text-red-600 dark:text-red-400";
   return (
     <span className={cn("tabular-nums font-medium", tone)}>
       {formatPaise(diffPaise, currency, { showSign: true })}
@@ -1531,8 +1677,7 @@ function AuditInspectorModal({
             ) : (
               <ul className="space-y-2">
                 {audit.discrepancies.map((d, i) => {
-                  const meta =
-                    DRIFT_LABELS[d.kind] ?? { label: d.kind, hint: "" };
+                  const meta = DRIFT_LABELS[d.kind] ?? { label: d.kind, hint: "" };
                   const sevTone =
                     ({
                       CRITICAL: "danger",
@@ -1577,15 +1722,11 @@ function AuditInspectorModal({
                         <div className="mt-2 grid grid-cols-3 gap-2 text-[11px] font-mono">
                           <div>
                             <div className="text-slate-500">expected</div>
-                            <div>
-                              {formatPaise(d.expectedPaise ?? "0", currency)}
-                            </div>
+                            <div>{formatPaise(d.expectedPaise ?? "0", currency)}</div>
                           </div>
                           <div>
                             <div className="text-slate-500">actual</div>
-                            <div>
-                              {formatPaise(d.actualPaise ?? "0", currency)}
-                            </div>
+                            <div>{formatPaise(d.actualPaise ?? "0", currency)}</div>
                           </div>
                           <div>
                             <div className="text-slate-500">Δ</div>
@@ -1624,11 +1765,7 @@ function AuditInspectorModal({
         </div>
 
         <DialogFooter>
-          <Button
-            variant="default"
-            size="sm"
-            onClick={() => onOpenChange(false)}
-          >
+          <Button variant="default" size="sm" onClick={() => onOpenChange(false)}>
             Close
           </Button>
         </DialogFooter>
@@ -1756,8 +1893,7 @@ function AuditHistory({
                 ) : (
                   <ul className="space-y-2">
                     {a.discrepancies.map((d, i) => {
-                      const meta =
-                        DRIFT_LABELS[d.kind] ?? { label: d.kind, hint: "" };
+                      const meta = DRIFT_LABELS[d.kind] ?? { label: d.kind, hint: "" };
                       const tone =
                         (sevBadgeVariant[
                           d.severity as keyof typeof sevBadgeVariant
@@ -1795,9 +1931,7 @@ function AuditHistory({
                             <div className="mt-2 grid grid-cols-3 gap-2 text-[11px] font-mono">
                               <div>
                                 <div className="text-slate-500">expected</div>
-                                <div>
-                                  {formatPaise(d.expectedPaise ?? "0")}
-                                </div>
+                                <div>{formatPaise(d.expectedPaise ?? "0")}</div>
                               </div>
                               <div>
                                 <div className="text-slate-500">actual</div>
@@ -1892,6 +2026,19 @@ export default function LedgerAdmin(props: {
   );
   const [error, setError] = React.useState<string | null>(null);
   const [loadingMore, setLoadingMore] = React.useState(false);
+
+  /**
+   * AbortController for banner mutations (reconcile / backfill / release
+   * / quarantine initiated from HealthBanner). Aborted when another
+   * banner mutation fires or on unmount; state updates are gated on
+   * `signal.aborted` so stale responses never clobber newer state.
+   *
+   * Dialog-submit mutations have their own AbortController scoped to
+   * each dialog (see ReleaseDialog / QuarantineDialog) because they
+   * outlive banner state (dialog can be closed mid-flight).
+   */
+  const bannerActionAbortRef = React.useRef<AbortController | null>(null);
+
   /**
    * Single source of truth for in-flight banner mutations. Set
    * synchronously when the operator clicks a banner button (or confirms
@@ -1913,9 +2060,19 @@ export default function LedgerAdmin(props: {
    */
   const [optimisticOp, setOptimisticOp] = React.useState<OptimisticOp>(null);
 
+  // Abort any in-flight banner mutation on unmount to prevent setState
+  // after unmount warnings and to avoid racing with teardown.
+  React.useEffect(() => {
+    return () => {
+      bannerActionAbortRef.current?.abort();
+      bannerActionAbortRef.current = null;
+    };
+  }, []);
+
   function clearOptimistic() {
     setOptimisticOp(null);
   }
+
   /**
    * Keyset cursor: id of the oldest entry currently rendered. Null means
    * we've loaded all the way back to genesis (or the server returned a
@@ -1957,7 +2114,7 @@ export default function LedgerAdmin(props: {
     tenantIdRef.current = overview.tenantId;
   }, [overview.tenantId]);
 
-  async function refreshChain() {
+  async function refreshChain(signal?: AbortSignal) {
     // On post-mutation refresh we reset pagination: re-fetch the first
     // page from the tail (newest entries) so newly appended rows appear
     // at the top immediately. Fetch enough entries to cover what the
@@ -1976,6 +2133,7 @@ export default function LedgerAdmin(props: {
         null, // null cursor = first page
         want
       );
+      if (signal?.aborted) return;
       // Stale response (a newer reset or load started after us)? Drop it
       // entirely to avoid overwriting fresher state.
       if (myEpoch !== chainEpochRef.current) return;
@@ -1984,6 +2142,7 @@ export default function LedgerAdmin(props: {
         setNextCursor(res.page.nextCursor);
       }
     } catch (e) {
+      if (signal?.aborted || isAbortError(e)) return;
       if (myEpoch === chainEpochRef.current) {
         console.error("[admin/ledger] refreshChain failed:", e);
       }
@@ -2025,12 +2184,14 @@ export default function LedgerAdmin(props: {
 
   async function afterMutation(
     label: string,
-    latest: AuditRunSummary | null | undefined
+    latest: AuditRunSummary | null | undefined,
+    signal?: AbortSignal
   ) {
     // RSC refresh keeps server-rendered chrome consistent; client-side
     // refetch picks up new entries immediately without window.location.
     router.refresh();
-    await refreshChain();
+    await refreshChain(signal);
+    if (signal?.aborted) return;
     if (latest && lastAuditIdRef.current !== latest.id) {
       toast.success(label, {
         description: `Status: ${latest.status} · scanned ${latest.entriesScanned} rows`,
@@ -2039,7 +2200,7 @@ export default function LedgerAdmin(props: {
     }
   }
 
-  function applyReconcile(r: ReconcileActionResult | BackfillActionResult) {
+  function applyReconcile(r: ReconcileActionResult | BackfillActionResult, signal?: AbortSignal) {
     let label = "Reconciliation complete";
     if (r.audit?.autoRemediated) label = "Auto-backfill completed";
     if (r.overview) setOverview(r.overview);
@@ -2047,91 +2208,167 @@ export default function LedgerAdmin(props: {
     const latest = r.audit ?? r.overview?.latestAudit ?? null;
     // Wait for refresh + chain reload so the optimistic override clears
     // against the authoritative server state rather than a stale view.
-    void afterMutation(label, latest).finally(clearOptimistic);
+    // `.finally(clearOptimistic)` is wrapped to abort-signal check so
+    // a superseded request never clears a newer optimistic state.
+    void afterMutation(label, latest, signal)
+      .catch((err) => {
+        if (signal?.aborted || isAbortError(err)) return;
+        console.error("[admin/ledger] afterMutation failed:", err);
+      })
+      .finally(() => {
+        if (!signal?.aborted) clearOptimistic();
+      });
   }
 
-  async function runReconcile() {
-    // Single source of truth: setting optimisticOp synchronously is
-    // what disables all banner buttons and flips aria-busy. No
-    // companion boolean is needed.
-    setOptimisticOp("RECONCILING");
-    setError(null);
-    try {
-      const r = await triggerTenantReconcileAction(tenantIdRef.current);
-      if (!r.ok) {
-        setError(r.error ?? "Reconcile failed.");
-        toast.error("Reconcile failed", {
-          description: r.error ?? undefined,
-        });
+  const runReconcile = React.useCallback(
+    async (e: React.MouseEvent<HTMLButtonElement>) => {
+      // ---- Layer 1: synchronous DOM lock ----
+      if (e.currentTarget.disabled) return;
+      e.currentTarget.disabled = true;
+
+      // ---- Layer 2: abort prior in-flight banner action ----
+      bannerActionAbortRef.current?.abort();
+      const ac = new AbortController();
+      bannerActionAbortRef.current = ac;
+      const signal = ac.signal;
+
+      // Single source of truth: setting optimisticOp synchronously is
+      // what disables all banner buttons and flips aria-busy. No
+      // companion boolean is needed.
+      setOptimisticOp("RECONCILING");
+      setError(null);
+      try {
+        const r = await triggerTenantReconcileAction(tenantIdRef.current);
+        if (signal.aborted) return;
+        if (!r.ok) {
+          setError(r.error ?? "Reconcile failed.");
+          toast.error("Reconcile failed", {
+            description: r.error ?? undefined,
+          });
+          clearOptimistic();
+        } else {
+          applyReconcile(r, signal);
+        }
+      } catch (err) {
+        if (signal.aborted || isAbortError(err)) return;
         clearOptimistic();
-      } else {
-        applyReconcile(r);
+        console.error("[admin/ledger] runReconcile threw:", err);
+        setError(err instanceof Error ? err.message : "Reconcile failed.");
       }
-    } catch (e) {
-      clearOptimistic();
-      console.error("[admin/ledger] runReconcile threw:", e);
-      setError(e instanceof Error ? e.message : "Reconcile failed.");
-    }
-  }
+    },
+    []
+  );
 
-  async function runBackfill() {
-    setOptimisticOp("BACKFILLING");
-    setError(null);
-    try {
-      const r = await backfillTenantAction(tenantIdRef.current);
-      if (!r.ok) {
-        setError(r.error ?? "Backfill failed.");
-        toast.error("Backfill failed", { description: r.error ?? undefined });
+  const runBackfill = React.useCallback(
+    async (e: React.MouseEvent<HTMLButtonElement>) => {
+      // Synchronous DOM lock.
+      if (e.currentTarget.disabled) return;
+      e.currentTarget.disabled = true;
+
+      bannerActionAbortRef.current?.abort();
+      const ac = new AbortController();
+      bannerActionAbortRef.current = ac;
+      const signal = ac.signal;
+
+      setOptimisticOp("BACKFILLING");
+      setError(null);
+      try {
+        const r = await backfillTenantAction(tenantIdRef.current);
+        if (signal.aborted) return;
+        if (!r.ok) {
+          setError(r.error ?? "Backfill failed.");
+          toast.error("Backfill failed", { description: r.error ?? undefined });
+          clearOptimistic();
+        } else {
+          applyReconcile(r, signal);
+        }
+      } catch (err) {
+        if (signal.aborted || isAbortError(err)) return;
         clearOptimistic();
-      } else {
-        applyReconcile(r);
+        console.error("[admin/ledger] runBackfill threw:", err);
+        setError(err instanceof Error ? err.message : "Backfill failed.");
       }
-    } catch (e) {
-      clearOptimistic();
-      console.error("[admin/ledger] runBackfill threw:", e);
-      setError(e instanceof Error ? e.message : "Backfill failed.");
-    }
-  }
+    },
+    []
+  );
 
-  function onReleaseStart() {
+  const onReleaseStart = React.useCallback(() => {
+    // Dialog submit is about to start (called synchronously from the
+    // dialog's onSubmit after its own DOM lock — but we still abort
+    // any stray banner action first).
+    bannerActionAbortRef.current?.abort();
+    bannerActionAbortRef.current = null;
     setOptimisticOp("RELEASING");
-  }
-  function onQuarantineStart() {
-    setOptimisticOp("QUARANTINING");
-  }
+  }, []);
 
-  function onRelease(r: ReleaseActionResult | QuarantineActionResult) {
-    if (r.overview) setOverview(r.overview);
-    if (r.recentAudits?.length) setAudits(r.recentAudits);
-    const isRelease = "released" in r;
-    const label = isRelease
-      ? r.forced
-        ? "Quarantine force-released"
-        : "Quarantine released"
-      : "Ledger quarantined";
-    const latest = r.audit ?? r.overview?.latestAudit ?? null;
-    // Wait for refresh + chain reload, then clear the optimistic flag so
-    // the server authoritative status (HEALTHY / QUARANTINED / DRIFT) renders.
-    void (async () => {
-      router.refresh();
-      await refreshChain();
-      clearOptimistic();
-      // Quarantine is an operator action that deserves an error-styled
-      // toast (writes are now blocked); releases are success.
-      if (!isRelease) {
-        toast.error(label, {
-          description: "Financial writes are now blocked.",
-        });
-      } else {
-        toast.success(label, {
-          description: latest
-            ? `Reconcile status: ${latest.status}`
-            : undefined,
-        });
-      }
-      if (latest) lastAuditIdRef.current = latest.id;
-    })();
-  }
+  const onQuarantineStart = React.useCallback(() => {
+    bannerActionAbortRef.current?.abort();
+    bannerActionAbortRef.current = null;
+    setOptimisticOp("QUARANTINING");
+  }, []);
+
+  const onRelease = React.useCallback(
+    (r: ReleaseActionResult | QuarantineActionResult) => {
+      if (r.overview) setOverview(r.overview);
+      if (r.recentAudits?.length) setAudits(r.recentAudits);
+      const isRelease = "released" in r;
+      const label = isRelease
+        ? r.forced
+          ? "Quarantine force-released"
+          : "Quarantine released"
+        : "Ledger quarantined";
+      const latest = r.audit ?? r.overview?.latestAudit ?? null;
+
+      // Spawn an abortable async chain so that if another mutation
+      // fires before this settles, we don't clobber newer state. Use
+      // try/catch/finally to GUARANTEE clearOptimistic() runs on every
+      // path (success, error, abort) — no more floating IIFEs without
+      // error handling.
+      bannerActionAbortRef.current?.abort();
+      const ac = new AbortController();
+      bannerActionAbortRef.current = ac;
+      const signal = ac.signal;
+
+      // Use an IIAFE (Immediately-Invoked Async Function Expression)
+      // wrapped in try/catch/finally so:
+      //   • Errors from router.refresh() / refreshChain() do not
+      //     produce unhandled promise rejections.
+      //   • clearOptimistic() runs in finally regardless of outcome.
+      //   • If the signal is aborted mid-flight (newer mutation fired),
+      //     we bail early and the newer action owns the optimistic slot.
+      void (async () => {
+        try {
+          router.refresh();
+          await refreshChain(signal);
+          if (signal.aborted) return;
+          clearOptimistic();
+          // Quarantine is an operator action that deserves an error-styled
+          // toast (writes are now blocked); releases are success.
+          if (!isRelease) {
+            toast.error(label, {
+              description: "Financial writes are now blocked.",
+            });
+          } else {
+            toast.success(label, {
+              description: latest
+                ? `Reconcile status: ${latest.status}`
+                : undefined,
+            });
+          }
+          if (latest) lastAuditIdRef.current = latest.id;
+        } catch (err) {
+          if (signal.aborted || isAbortError(err)) return;
+          console.error("[admin/ledger] post-release settle failed:", err);
+          clearOptimistic();
+        } finally {
+          if (bannerActionAbortRef.current === ac) {
+            bannerActionAbortRef.current = null;
+          }
+        }
+      })();
+    },
+    []
+  );
 
   // Paise Inspector (Section C) — controlled modal state. The inspected
   // audit is a stable reference so open/close doesn't cause flicker as
@@ -2139,9 +2376,7 @@ export default function LedgerAdmin(props: {
   const [inspectorOpen, setInspectorOpen] = React.useState(false);
   const [inspectedAudit, setInspectedAudit] =
     React.useState<AuditRunSummary | null>(null);
-  const inspectedAuditRef = React.useRef<AuditRunSummary | null>(null);
   function openInspector(audit: AuditRunSummary) {
-    inspectedAuditRef.current = audit;
     setInspectedAudit(audit);
     setInspectorOpen(true);
   }

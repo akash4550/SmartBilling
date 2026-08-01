@@ -9,7 +9,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { requireUser, jsonError, unauthorized } from "@/lib/api-helpers";
-import { rateLimit } from "@/lib/rate-limit";
+import { checkRateLimit } from "@/lib/rate-limiter";
 import { clientIp } from "@/lib/activity";
 
 // L7: 500 KB cap (base64-encoded ≈ 666 KB stored — still well under any
@@ -31,16 +31,13 @@ export async function POST(request: Request) {
     if (!user) return unauthorized();
 
     const ip = clientIp(request);
-    const rl = rateLimit(`logo-up:${user.id}:${ip}`, {
+    const rl = await checkRateLimit(`logo-up:${user.id}:${ip}`, {
       namespace: "logo-upload",
       limit: 20,
       windowSec: 60,
     });
     if (!rl.allowed) {
-      return NextResponse.json(
-        { error: "Too many requests. Try again shortly." },
-        { status: 429 }
-      );
+      return rl.toResponse('Too many requests. Try again shortly.');
     }
 
     const ct = request.headers.get("content-type") || "";

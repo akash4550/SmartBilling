@@ -3,7 +3,7 @@ import crypto from "node:crypto";
 import { Resend } from "resend";
 import { prisma } from "@/lib/prisma";
 import { getSiteUrl } from "@/lib/stripe";
-import { rateLimit, requestKey } from "@/lib/rate-limit";
+import { checkRateLimit, requestKey } from "@/lib/rate-limiter";
 
 /**
  * POST /api/auth/forgot-password
@@ -15,9 +15,9 @@ import { rateLimit, requestKey } from "@/lib/rate-limit";
  */
 export async function POST(request: Request) {
   try {
-    const rl = rateLimit(requestKey(request), { namespace: "auth:forgot", limit: 5, windowSec: 60 * 10 });
+    const rl = await checkRateLimit(requestKey(request), { namespace: "auth:forgot", limit: 5, windowSec: 60 * 10 });
     if (!rl.allowed) {
-      return NextResponse.json({ error: "Too many attempts — try again later." }, { status: 429 });
+      return rl.toResponse('Too many attempts — try again later.');
     }
 
     const body = (await request.json().catch(() => ({}))) as { email?: string };

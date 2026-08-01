@@ -9,7 +9,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { requireUser, unauthorized, jsonError } from "@/lib/api-helpers";
-import { rateLimit, requestKey } from "@/lib/rate-limit";
+import { checkRateLimit, requestKey } from "@/lib/rate-limiter";
 import { withTenant } from "@/lib/tenant";
 import { postLedgerEvents } from "@/lib/ledger";
 import type { LedgerEventInput } from "@/lib/ledger";
@@ -72,16 +72,13 @@ export async function POST(request: Request) {
     const user = await requireUser();
     if (!user) return unauthorized();
 
-    const rl = rateLimit(requestKey(request, "import-expenses"), {
+    const rl = await checkRateLimit(requestKey(request, "import-expenses"), {
       namespace: "import-expenses",
       limit: 5,
       windowSec: 60,
     });
     if (!rl.allowed) {
-      return NextResponse.json(
-        { error: "Too many imports — please wait a minute before trying again." },
-        { status: 429 }
-      );
+      return rl.toResponse('Too many imports — please wait a minute before trying again.');
     }
 
     let payload: unknown;

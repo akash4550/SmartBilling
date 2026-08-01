@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { ZodError, z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { jsonError, validationErrorResponse, getPrismaErrorCode } from "@/lib/api-helpers";
-import { rateLimit, requestKey } from "@/lib/rate-limit";
+import { checkRateLimit, requestKey } from "@/lib/rate-limiter";
 
 const registerSchema = z.object({
   name: z
@@ -33,19 +33,13 @@ export async function POST(request: Request) {
   try {
     // 5 sign-ups per IP per minute is generous for humans but blocks
     // automated account spam.
-    const rl = rateLimit(requestKey(request), {
+    const rl = await checkRateLimit(requestKey(request), {
       namespace: "register",
       limit: 5,
       windowSec: 60,
     });
     if (!rl.allowed) {
-      return NextResponse.json(
-        { error: "Too many sign-up attempts — please try again later." },
-        {
-          status: 429,
-          headers: { "Retry-After": String(Math.ceil(rl.retryAfterMs / 1000)) },
-        }
-      );
+      return rl.toResponse('Too many sign-up attempts — please try again later.');
     }
 
     const body = await request.json();

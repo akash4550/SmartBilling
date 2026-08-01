@@ -7,7 +7,7 @@ import {
   jsonError,
 } from "@/lib/api-helpers";
 import { renderInvoiceEmail } from "@/lib/email";
-import { rateLimit, requestKey } from "@/lib/rate-limit";
+import { checkRateLimit, requestKey } from "@/lib/rate-limiter";
 
 /**
  * POST /api/dashboard/remind-overdue
@@ -37,27 +37,21 @@ export async function POST(request: Request) {
     }
 
     // Stricter rate limit on bulk endpoint — one batch per minute.
-    const userRl = rateLimit(`bulk-remind:${user.id}`, {
+    const userRl = await checkRateLimit(`bulk-remind:${user.id}`, {
       namespace: "bulk-remind",
       limit: 3,
       windowSec: 60,
     });
     if (!userRl.allowed) {
-      return NextResponse.json(
-        { error: "Please wait a moment before sending another bulk reminder batch." },
-        { status: 429, headers: { "Retry-After": String(Math.ceil(userRl.retryAfterMs / 1000)) } }
-      );
+      return userRl.toResponse('Please wait a moment before sending another bulk reminder batch.');
     }
-    const ipRl = rateLimit(requestKey(request), {
+    const ipRl = await checkRateLimit(requestKey(request), {
       namespace: "bulk-remind:ip",
       limit: 10,
       windowSec: 60 * 10,
     });
     if (!ipRl.allowed) {
-      return NextResponse.json(
-        { error: "Too many requests — please try again later." },
-        { status: 429, headers: { "Retry-After": String(Math.ceil(ipRl.retryAfterMs / 1000)) } }
-      );
+      return ipRl.toResponse('Too many requests — please try again later.');
     }
 
     const siteUrl =

@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { requireUser, unauthorized, jsonError } from "@/lib/api-helpers";
-import { rateLimit, requestKey } from "@/lib/rate-limit";
+import { checkRateLimit, requestKey } from "@/lib/rate-limiter";
 import { z } from "zod";
 import { sendPortalInviteEmail } from "@/lib/send-portal-invite";
 import { clientIp } from "@/lib/activity";
@@ -44,16 +44,13 @@ export async function POST(request: Request, { params }: RouteParams) {
 
     // Rate limit: 10 emails per minute per user — protects against accidental
     // double-sends without being overly restrictive.
-    const rl = rateLimit(requestKey(request, "send-portal"), {
+    const rl = await checkRateLimit(requestKey(request, "send-portal"), {
       namespace: "send-portal-link",
       limit: 10,
       windowSec: 60,
     });
     if (!rl.allowed) {
-      return NextResponse.json(
-        { error: "Too many requests — please wait a moment before sending again." },
-        { status: 429 },
-      );
+      return rl.toResponse('Too many requests — please try again a moment before sending again.');
     }
 
     const client = await prisma.client.findFirst({

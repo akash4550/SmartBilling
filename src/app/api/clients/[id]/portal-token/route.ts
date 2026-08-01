@@ -7,7 +7,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { requireUser, unauthorized, jsonError } from "@/lib/api-helpers";
-import { rateLimit, requestKey } from "@/lib/rate-limit";
+import { checkRateLimit, requestKey } from "@/lib/rate-limiter";
 import { randomUUID } from "crypto";
 
 interface RouteParams {
@@ -19,16 +19,13 @@ export async function POST(request: Request, { params }: RouteParams) {
     const user = await requireUser();
     if (!user) return unauthorized();
 
-    const rl = rateLimit(requestKey(request, `portal-token:${user.id}`), {
+    const rl = await checkRateLimit(requestKey(request, `portal-token:${user.id}`), {
       namespace: "clients:portal-token",
       limit: 20,
       windowSec: 60,
     });
     if (!rl.allowed) {
-      return NextResponse.json(
-        { error: "Too many requests — please try again later." },
-        { status: 429, headers: { "Retry-After": String(Math.ceil(rl.retryAfterMs / 1000)) } }
-      );
+      return rl.toResponse('Too many requests — please try again later.');
     }
 
     const { id } = await params;

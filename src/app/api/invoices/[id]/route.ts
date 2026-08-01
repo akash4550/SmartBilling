@@ -11,7 +11,7 @@ import {
   getPrismaErrorCode,
 } from "@/lib/api-helpers";
 import { logActivity, clientIp } from "@/lib/activity";
-import { rateLimit, requestKey } from "@/lib/rate-limit";
+import { checkRateLimit, requestKey } from "@/lib/rate-limiter";
 import { markInvoicePaid, voidInvoice } from "@/lib/invoice-helpers";
 import { withTenant } from "@/lib/tenant";
 import { postLedgerEvent } from "@/lib/ledger";
@@ -49,19 +49,13 @@ export async function GET(request: Request, { params }: RouteParams) {
     const { id } = await params;
 
     // Rate-limit public invoice fetches (CUID brute-force protection).
-    const rl = rateLimit(requestKey(request), {
+    const rl = await checkRateLimit(requestKey(request), {
       namespace: "public:get-invoice",
       limit: 60,
       windowSec: 60,
     });
     if (!rl.allowed) {
-      return NextResponse.json(
-        { error: "Too many requests — please try again later." },
-        {
-          status: 429,
-          headers: { "Retry-After": String(Math.ceil(rl.retryAfterMs / 1000)) },
-        }
-      );
+      return rl.toResponse('Too many requests — please try again later.');
     }
 
     const invoice = await prisma.invoice.findUnique({

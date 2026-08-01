@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import crypto from "node:crypto";
 import { prisma } from "@/lib/prisma";
-import { rateLimit, requestKey } from "@/lib/rate-limit";
+import { checkRateLimit, requestKey } from "@/lib/rate-limiter";
 import { z } from "zod";
 
 const resetSchema = z.object({
@@ -23,9 +23,9 @@ const resetSchema = z.object({
  */
 export async function POST(request: Request) {
   try {
-    const rl = rateLimit(requestKey(request), { namespace: "auth:reset", limit: 5, windowSec: 60 * 10 });
+    const rl = await checkRateLimit(requestKey(request), { namespace: "auth:reset", limit: 5, windowSec: 60 * 10 });
     if (!rl.allowed) {
-      return NextResponse.json({ error: "Too many attempts — try again later." }, { status: 429 });
+      return rl.toResponse('Too many attempts — try again later.');
     }
 
     const body = (await request.json().catch(() => ({}))) as { token?: string; password?: string };

@@ -3,7 +3,7 @@ import OpenAI from "openai";
 import { z } from "zod";
 import { invoiceItemSchema } from "@/lib/validations";
 import { requireUser, unauthorized } from "@/lib/api-helpers";
-import { rateLimit, requestKey } from "@/lib/rate-limit";
+import { checkRateLimit, requestKey } from "@/lib/rate-limiter";
 
 // ---------------------------------------------------------------------------
 // Schema for the AI-parsed receipt response
@@ -57,19 +57,13 @@ export async function POST(request: Request) {
     if (!user) return unauthorized();
 
     // Rate limit per user (5 uploads per minute) to prevent burning OpenAI credits.
-    const rl = rateLimit(requestKey(request, user.id), {
+    const rl = await checkRateLimit(requestKey(request, user.id), {
       namespace: "parse-receipt",
       limit: 5,
       windowSec: 60,
     });
     if (!rl.allowed) {
-      return NextResponse.json(
-        { error: "Too many receipt uploads — please wait a minute and try again." },
-        {
-          status: 429,
-          headers: { "Retry-After": String(Math.ceil(rl.retryAfterMs / 1000)) },
-        }
-      );
+      return rl.toResponse('Too many receipt uploads — please wait a minute and try again.');
     }
 
     // 1. Parse and validate the incoming request body

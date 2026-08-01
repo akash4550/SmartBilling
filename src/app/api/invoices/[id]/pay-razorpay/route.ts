@@ -6,7 +6,7 @@ import {
   verifyRazorpaySignature,
 } from "@/lib/razorpay";
 import { markInvoicePaid } from "@/lib/invoice-helpers";
-import { rateLimit, requestKey } from "@/lib/rate-limit";
+import { checkRateLimit, requestKey } from "@/lib/rate-limiter";
 import { toSubunit } from "@/lib/money";
 
 interface RouteParams {
@@ -24,21 +24,13 @@ export async function POST(request: Request, { params }: RouteParams) {
   try {
     const { id } = await params;
 
-    const rl = rateLimit(requestKey(request), {
+    const rl = await checkRateLimit(requestKey(request), {
       namespace: "razorpay:checkout",
       limit: 10,
       windowSec: 60,
     });
     if (!rl.allowed) {
-      return NextResponse.json(
-        { error: "Too many payment attempts — please try again later." },
-        {
-          status: 429,
-          headers: {
-            "Retry-After": String(Math.ceil(rl.retryAfterMs / 1000)),
-          },
-        }
-      );
+      return rl.toResponse('Too many payment attempts — please try again later.');
     }
 
     if (!razorpayConfigured()) {

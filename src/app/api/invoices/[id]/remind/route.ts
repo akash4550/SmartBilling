@@ -8,7 +8,7 @@ import {
 } from "@/lib/api-helpers";
 import { getSiteUrl } from "@/lib/stripe";
 import { getBrandingForUser } from "@/lib/branding";
-import { rateLimit, requestKey } from "@/lib/rate-limit";
+import { checkRateLimit, requestKey } from "@/lib/rate-limiter";
 import { logActivity, clientIp } from "@/lib/activity";
 import { sendInvoiceEmail } from "@/lib/send-invoice-email";
 
@@ -42,36 +42,22 @@ export async function POST(request: Request, { params }: RouteParams) {
 
     // Per-user rate limit to discourage bulk-abuse of the Resend API via
     // repeated individual calls.
-    const rl = rateLimit(`remind:${user.id}`, {
+    const rl = await checkRateLimit(`remind:${user.id}`, {
       namespace: "send-reminder",
       limit: 30,
       windowSec: 60 * 60, // 30 reminders / hour / user
     });
     if (!rl.allowed) {
-      return NextResponse.json(
-        {
-          error: "Too many reminders sent. Please try again later.",
-        },
-        {
-          status: 429,
-          headers: { "Retry-After": String(Math.ceil(rl.retryAfterMs / 1000)) },
-        }
-      );
+      return rl.toResponse("Too many reminder attempts — please try again later.");
     }
     // Also IP-rate-limit to harden against stolen sessions.
-    const ipRl = rateLimit(requestKey(request), {
+    const ipRl = await checkRateLimit(requestKey(request), {
       namespace: "send-reminder:ip",
       limit: 60,
       windowSec: 60 * 10,
     });
     if (!ipRl.allowed) {
-      return NextResponse.json(
-        { error: "Too many requests — please try again later." },
-        {
-          status: 429,
-          headers: { "Retry-After": String(Math.ceil(ipRl.retryAfterMs / 1000)) },
-        }
-      );
+      return ipRl.toResponse("Too many requests — please try again later.");
     }
 
     if (!process.env.RESEND_API_KEY) {

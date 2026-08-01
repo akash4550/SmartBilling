@@ -22,6 +22,12 @@
  * field and carry domain-specific readonly metadata (userId, retryAfterMs,
  * etc.) on the instance so callers can branch on structured data rather
  * than string-matching messages.
+ *
+ * Naming convention: every error class carries the `Error` suffix
+ * (e.g. `LedgerQuarantinedError`, `ReadOnlyModeError`,
+ * `RateLimitExceededError`). The suffix is omitted from the `name`
+ * string only where a stable wire/log identifier would otherwise change
+ * — here we keep them aligned (name === class name) for consistency.
  */
 
 // ---------------------------------------------------------------------------
@@ -148,17 +154,20 @@ export class ReadOnlyModeError extends Error {
  * `rl.toResponse()` on the accompanying RateLimitResult for a
  * standards-compliant 429; Server Actions can surface `err.message`
  * to Sonner.
+ *
+ * Renamed from `RateLimitExceeded` → `RateLimitExceededError` to align
+ * with the `*Error` suffix used by every other class in this module.
  */
-export class RateLimitExceeded extends Error {
+export class RateLimitExceededError extends Error {
   public readonly retryAfterMs: number;
   public readonly limit: number;
   public readonly windowSec: number;
   constructor(message: string, retryAfterMs: number, limit: number, windowSec: number) {
     super(message);
-    this.name = "RateLimitExceeded";
+    this.name = "RateLimitExceededError";
     this.retryAfterMs = retryAfterMs;
     this.limit = limit;
     this.windowSec = windowSec;
-    Object.setPrototypeOf(this, RateLimitExceeded.prototype);
+    Object.setPrototypeOf(this, RateLimitExceededError.prototype);
   }
 }

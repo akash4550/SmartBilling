@@ -13,7 +13,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { requireUser, unauthorized, jsonError } from "@/lib/api-helpers";
-import { rateLimit, requestKey } from "@/lib/rate-limit";
+import { checkRateLimit, requestKey } from "@/lib/rate-limiter";
 import { z } from "zod";
 import { clientSchema } from "@/lib/validations";
 import { logActivity, clientIp } from "@/lib/activity";
@@ -64,16 +64,13 @@ export async function POST(request: Request) {
     if (!user) return unauthorized();
 
     // Rate limit: 5 imports per minute per user.
-    const rl = rateLimit(requestKey(request, "import-clients"), {
+    const rl = await checkRateLimit(requestKey(request, "import-clients"), {
       namespace: "import-clients",
       limit: 5,
       windowSec: 60,
     });
     if (!rl.allowed) {
-      return NextResponse.json(
-        { error: "Too many imports — please wait a minute before trying again." },
-        { status: 429 }
-      );
+      return rl.toResponse('Too many imports — please wait a minute before trying again.');
     }
 
     let payload: unknown;

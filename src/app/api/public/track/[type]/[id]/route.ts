@@ -12,7 +12,7 @@
  */
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { rateLimit, requestKey } from "@/lib/rate-limit";
+import { checkRateLimit, requestKey } from "@/lib/rate-limiter";
 import { logActivity } from "@/lib/activity";
 
 export const runtime = "nodejs";
@@ -47,7 +47,7 @@ export async function GET(
   }
 
   // Tracking pixels should always return the image quickly.
-  const rl = rateLimit(requestKey(request, `track-${id}`), {
+  const rl = await checkRateLimit(requestKey(request, `track-${id}`), {
     namespace: "track-open",
     limit: 30,
     windowSec: 60,

@@ -17,7 +17,7 @@ import { sendInvoiceEmail } from "@/lib/send-invoice-email";
 import { logActivity, clientIp } from "@/lib/activity";
 import { getSiteUrl } from "@/lib/stripe";
 import { getBrandingForUser } from "@/lib/branding";
-import { rateLimit, requestKey } from "@/lib/rate-limit";
+import { checkRateLimit, requestKey } from "@/lib/rate-limiter";
 
 export const runtime = "nodejs";
 
@@ -29,16 +29,13 @@ export async function POST(request: Request) {
     if (!user) return unauthorized();
 
     // Per-user rate limit (bulk actions send emails / write many rows).
-    const rl = rateLimit(requestKey(request, `bulk:${user.id}`), {
+    const rl = await checkRateLimit(requestKey(request, `bulk:${user.id}`), {
       namespace: "invoices:bulk",
       limit: 10,
       windowSec: 60,
     });
     if (!rl.allowed) {
-      return NextResponse.json(
-        { error: "Too many bulk actions — please try again later." },
-        { status: 429, headers: { "Retry-After": String(Math.ceil(rl.retryAfterMs / 1000)) } }
-      );
+      return rl.toResponse('Too many bulk actions — please try again later.');
     }
 
     const body = await request.json().catch(() => ({}));

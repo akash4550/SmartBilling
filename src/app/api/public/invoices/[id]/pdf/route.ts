@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { jsonError, getPrismaErrorCode } from "@/lib/api-helpers";
 import { loadInvoiceForPdf, renderInvoicePdfToBuffer } from "@/lib/pdf";
-import { rateLimit, requestKey } from "@/lib/rate-limit";
+import { checkRateLimit, requestKey } from "@/lib/rate-limiter";
 
 interface RouteParams {
   params: Promise<{ id: string }>;
@@ -19,19 +19,13 @@ export async function GET(request: Request, { params }: RouteParams) {
   try {
     const { id } = await params;
 
-    const rl = rateLimit(requestKey(request), {
+    const rl = await checkRateLimit(requestKey(request), {
       namespace: "public:get-invoice-pdf",
       limit: 30,
       windowSec: 60,
     });
     if (!rl.allowed) {
-      return NextResponse.json(
-        { error: "Too many requests — please try again later." },
-        {
-          status: 429,
-          headers: { "Retry-After": String(Math.ceil(rl.retryAfterMs / 1000)) },
-        }
-      );
+      return rl.toResponse('Too many requests — please try again later.');
     }
 
     let data;

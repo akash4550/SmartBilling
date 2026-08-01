@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getStripe, getSiteUrl } from "@/lib/stripe";
-import { rateLimit, requestKey } from "@/lib/rate-limit";
+import { checkRateLimit, requestKey } from "@/lib/rate-limiter";
 import { toSubunit } from "@/lib/money";
 import type { Stripe } from "stripe";
 
@@ -23,21 +23,13 @@ export async function POST(request: Request, { params }: RouteParams) {
   try {
     const { id } = await params;
 
-    const rl = rateLimit(requestKey(request), {
+    const rl = await checkRateLimit(requestKey(request), {
       namespace: "stripe:checkout",
       limit: 10,
       windowSec: 60,
     });
     if (!rl.allowed) {
-      return NextResponse.json(
-        { error: "Too many payment attempts — please try again later." },
-        {
-          status: 429,
-          headers: {
-            "Retry-After": String(Math.ceil(rl.retryAfterMs / 1000)),
-          },
-        }
-      );
+      return rl.toResponse('Too many payment attempts — please try again later.');
     }
 
     const stripe = await getStripe();

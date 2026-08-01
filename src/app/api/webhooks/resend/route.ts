@@ -11,7 +11,7 @@
 import { NextResponse } from "next/server";
 import { createHmac, timingSafeEqual } from "crypto";
 import { ingestWebhook } from "@/lib/webhook-ingestion";
-import { rateLimit, requestKey } from "@/lib/rate-limit";
+import { checkRateLimit, requestKey } from "@/lib/rate-limiter";
 
 export const dynamic = "force-dynamic";
 
@@ -75,13 +75,13 @@ function verifySvixSignature(
 
 export async function POST(request: Request) {
   try {
-    const rl = rateLimit(requestKey(request), {
+    const rl = await checkRateLimit(requestKey(request), {
       namespace: "webhook:resend",
       limit: 120,
       windowSec: 60,
     });
     if (!rl.allowed) {
-      return NextResponse.json({ error: "Too many requests" }, { status: 429 });
+      return rl.toResponse('Too many requests.');
     }
 
     const secret = process.env.RESEND_WEBHOOK_SECRET;
