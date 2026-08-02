@@ -17,7 +17,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-smartbill}
       POSTGRES_DB: ${POSTGRES_DB:-smart_billing}
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -28,15 +28,21 @@ services:
 
   app:
     build: .
+    env_file:
+      - .env
     container_name: smart-billing-app
     restart: unless-stopped
     depends_on:
       db:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-smartbill}:${POSTGRES_PASSWORD:-smartbill}@db:5432/${POSTGRES_DB:-smart_billing}?schema=public
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      NODE_ENV: production
+      - DATABASE_URL=${DATABASE_URL}
+      - OPENAI_API_KEY=sk-dummy-test-key-1234567890
+      - NODE_ENV=production
+      - NEXTAUTH_URL=http://localhost:3000
+      - NEXTAUTH_SECRET=supersecretplaywrighttestkey123!
+      - AUTH_SECRET=supersecretplaywrighttestkey123!
+      - AUTH_TRUST_HOST=true
     ports:
       - "3000:3000"
 

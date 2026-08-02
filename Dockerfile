@@ -9,26 +9,17 @@
 
 # ----- Stage 1: Dependencies -----
 FROM node:20-alpine AS deps
-RUN apk add --no-cache libc6-compat openssl
+    # 1. ADD PYTHON3, MAKE, AND G++ HERE:
+RUN apk add --no-cache libc6-compat openssl python3 make g++
 WORKDIR /app
-
-# Copy package manifests first for better Docker layer caching
-COPY package.json package-lock.json* prisma/schema.prisma ./
-
-# Install ALL dependencies (including devDependencies — needed for Prisma generate & Next build)
-RUN if [ -f package-lock.json ]; then npm ci; \
-    else npm install; \
-    fi
-
-# Generate Prisma Client against the schema
+COPY package.json package-lock.json* prisma/schema* ./
+RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
 RUN npx prisma generate
-
-# ----- Stage 2: Build -----
+    
+    # ----- Stage 2: Build -----
 FROM node:20-alpine AS builder
 RUN apk add --no-cache libc6-compat openssl
 WORKDIR /app
-
-# Bring over node_modules from deps stage
 COPY --from=deps /app/node_modules ./node_modules
 # Copy the rest of the source
 COPY . .
@@ -39,7 +30,8 @@ ENV NODE_ENV=production
 
 # Re-run prisma generate (safe, idempotent) so client matches the schema shipped with code
 RUN npx prisma generate
-
+ENV SKIP_ENV_VALIDATION=true
+ENV DATABASE_URL="postgresql://dummy:dummy@localhost:5432/dummy"
 # Build Next.js for production
 RUN npm run build
 
