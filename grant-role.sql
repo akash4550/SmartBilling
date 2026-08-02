@@ -1,0 +1,1 @@
+GRANT app_user TO CURRENT_USER;
