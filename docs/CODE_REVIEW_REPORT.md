@@ -1,5 +1,7 @@
 # SmartBill — Senior Staff Engineer Code Review
 
+> **Archived review snapshot:** This report was produced against an earlier implementation. Several findings—especially API authentication, database-backed password hashing, standalone public layouts, dedicated public endpoints, dashboard summary APIs, and seed tax rounding—are already addressed on current `main` (`3789d0f`). Revalidate each finding against the current code before acting on it.
+
 **Project:** Next.js 16 (App Router) · TypeScript (strict) · Prisma 5 / PostgreSQL · NextAuth v5 beta · Tailwind + Shadcn-style primitives · Resend · OpenAI (gpt-4o-mini) · Recharts · Framer Motion v12
 **Scope:** every `.ts`/`.tsx` under `src/` + `prisma/schema.prisma`, `prisma/seed.ts`, `Dockerfile`, `middleware.ts`, config.
 **Sanity checks performed:**
