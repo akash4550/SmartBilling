@@ -1,5 +1,7 @@
 # Smart Billing Application
 
+[![CI](https://github.com/akash4550/SmartBilling/actions/workflows/ci.yml/badge.svg)](https://github.com/akash4550/SmartBilling/actions/workflows/ci.yml)
+
 A modern, full-stack invoicing and billing application built with:
 
 - **Next.js 16 (App Router, Turbopack)** with React 19
