@@ -3,7 +3,6 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
 import {
   Activity,
   Plus,
@@ -12,7 +11,6 @@ import {
   BellRing,
   Eye,
   CheckCircle2,
-  AlertCircle,
   FileText,
   Download,
   Trash2,

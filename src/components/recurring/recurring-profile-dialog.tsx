@@ -56,12 +56,6 @@ function toLocalISODate(d: Date): string {
   return `${y}-${m}-${day}`;
 }
 
-const FREQ_LABEL: Record<RecurrenceFrequency, string> = {
-  WEEKLY: "Every week",
-  MONTHLY: "Every month",
-  YEARLY: "Every year",
-  CUSTOM_DAYS: "Every N days",
-};
 
 export function RecurringProfileDialog({ trigger, profile, onSuccess }: RecurringProfileDialogProps) {
   const router = useRouter();
@@ -102,26 +96,20 @@ export function RecurringProfileDialog({ trigger, profile, onSuccess }: Recurrin
   // Hydrate from profile when editing
   useEffect(() => {
     if (!open || !profile) return;
-    setClientId(profile.clientId);
-    setFrequency(profile.frequency);
-    setIntervalDays(String(profile.intervalDays ?? 30));
-    setDueInDays(String(profile.dueInDays));
-    setTaxRate(String(Number(profile.taxRate)));
-    setNotes(profile.notes ?? "");
-    setAutoSend(profile.autoSend);
-    setActive(profile.active);
-    setStartDate(toLocalISODate(new Date(profile.nextRunAt)));
-    setEndDate(profile.endDate ? toLocalISODate(new Date(profile.endDate)) : "");
-    setItems(
-      profile.items.length > 0
-        ? profile.items.map((i) => ({
-            id: i.id,
-            description: i.description,
-            quantity: String(i.quantity),
-            price: String(Number(i.price)),
-          }))
-        : [emptyItem()]
-    );
+    const timer = setTimeout(() => {
+      setClientId(profile.clientId);
+      setFrequency(profile.frequency);
+      setIntervalDays(String(profile.intervalDays ?? 30));
+      setDueInDays(String(profile.dueInDays));
+      setTaxRate(String(Number(profile.taxRate)));
+      setNotes(profile.notes ?? "");
+      setAutoSend(profile.autoSend);
+      setActive(profile.active);
+      setStartDate(toLocalISODate(new Date(profile.nextRunAt)));
+      setEndDate(profile.endDate ? toLocalISODate(new Date(profile.endDate)) : "");
+      setItems(profile.items.length > 0 ? profile.items.map((i) => ({ id: i.id, description: i.description, quantity: String(i.quantity), price: String(Number(i.price)) })) : [emptyItem()]);
+    }, 0);
+    return () => clearTimeout(timer);
   }, [open, profile]);
 
   function reset() {

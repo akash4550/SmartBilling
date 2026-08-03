@@ -39,20 +39,21 @@ export function EditClientDialog({ client, open, onOpenChange, onSuccess }: Edit
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    if (client && open) {
+    if (!client || !open) return;
+    const timer = setTimeout(() => {
       setForm({
         name: client.name ?? "",
         email: client.email ?? "",
         address: client.address ?? "",
         phone: client.phone ?? "",
         notes: (client as { notes?: string | null }).notes ?? "",
-        dueDays:
-          (client as { dueDays?: number | null }).dueDays != null
-            ? String((client as { dueDays?: number | null }).dueDays)
-            : "",
+        dueDays: (client as { dueDays?: number | null }).dueDays != null
+          ? String((client as { dueDays?: number | null }).dueDays)
+          : "",
       });
       setErrors({});
-    }
+    }, 0);
+    return () => clearTimeout(timer);
   }, [client, open]);
 
   async function handleSubmit(e: React.FormEvent) {

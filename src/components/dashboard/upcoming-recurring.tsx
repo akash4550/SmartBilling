@@ -22,8 +22,10 @@ function nextRunLabel(d: string | Date): string {
 
 export function UpcomingRecurring() {
   const [profiles, setProfiles] = useState<RecurringProfileWithRelations[] | null>(null);
+  const [now, setNow] = useState(0);
 
   useEffect(() => {
+    const timer = setTimeout(() => setNow(Date.now()), 0);
     (async () => {
       try {
         const res = await fetch("/api/recurring", { cache: "no-store" });
@@ -39,6 +41,7 @@ export function UpcomingRecurring() {
         /* ignore */
       }
     })();
+    return () => clearTimeout(timer);
   }, []);
 
   if (profiles === null) {
@@ -83,7 +86,7 @@ export function UpcomingRecurring() {
         ) : (
           <>
             {profiles.map((p) => {
-              const isDue = new Date(p.nextRunAt).getTime() <= Date.now();
+              const isDue = now > 0 && new Date(p.nextRunAt).getTime() <= now;
               const amount = p.items.reduce(
                 (sum, i) => sum + (Number(i.quantity) || 0) * (Number(i.price) || 0),
                 0

@@ -40,7 +40,6 @@ import { SendInvoiceButton } from "@/components/invoices/send-invoice-button";
 import { DownloadPdfButton } from "@/components/invoices/download-pdf-button";
 import { RemindInvoiceButton } from "@/components/invoices/remind-invoice-button";
 import { PayInvoiceButton } from "@/components/invoices/pay-invoice-button";
-import { PayMethods } from "@/components/invoices/pay-methods";
 import { ActivityTimeline } from "@/components/invoices/activity-timeline";
 import { DuplicateInvoiceButton } from "@/components/invoices/duplicate-invoice-button";
 import { CopyLinkButton } from "@/components/invoices/copy-link-button";
@@ -117,7 +116,10 @@ export default function InvoiceDetailPage() {
     }
   }, [id]);
 
-  useEffect(() => { fetchAll(); }, [fetchAll]);
+  useEffect(() => {
+    const timer = setTimeout(() => { void fetchAll(); }, 0);
+    return () => clearTimeout(timer);
+  }, [fetchAll]);
 
   async function handleMarkPaid() {
     if (!invoice || !confirm("Mark this invoice as paid?")) return;
@@ -537,7 +539,7 @@ export default function InvoiceDetailPage() {
               )}
               {isDraft && (
                 <div className="p-4 rounded-xl bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-center">
-                  <p className="text-sm text-slate-600 dark:text-slate-400">This is a draft invoice — it hasn't been sent to the client yet.</p>
+                  <p className="text-sm text-slate-600 dark:text-slate-400">This is a draft invoice — it hasn&apos;t been sent to the client yet.</p>
                 </div>
               )}
             </div>

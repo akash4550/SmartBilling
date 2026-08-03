@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { signOut } from "next-auth/react";
-import { useForm } from "react-hook-form";
+import { useForm, useWatch } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import Link from "next/link";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -48,7 +48,7 @@ export default function AccountSettingsPage() {
     handleSubmit,
     reset,
     setError,
-    watch,
+    control,
     formState: { errors },
   } = useForm<AccountInput>({
     resolver: zodResolver(accountSchema),
@@ -60,10 +60,7 @@ export default function AccountSettingsPage() {
       confirmPassword: "",
     },
   });
-
-  const newPassword = watch("newPassword");
-  const currentName = watch("name");
-  const currentEmail = watch("email");
+  const newPassword = useWatch({ control, name: "newPassword" });
 
   useEffect(() => {
     let active = true;

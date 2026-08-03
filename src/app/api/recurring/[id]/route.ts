@@ -3,7 +3,6 @@ import { ZodError } from "zod";
 import { prisma } from "@/lib/prisma";
 import { requireUser, unauthorized, jsonError, validationErrorResponse } from "@/lib/api-helpers";
 import { recurringProfileSchema } from "@/lib/validations";
-import { generateInvoiceFromProfile, computeNextRun } from "@/lib/recurring";
 
 interface RouteParams {
   params: Promise<{ id: string }>;

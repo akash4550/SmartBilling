@@ -171,20 +171,21 @@ export function InvoiceForm({
 
   // Sync selected client once the clients list loads in create mode.
   useEffect(() => {
-    if (!isEdit && !clientId && clients.length > 0) {
+    if (isEdit || clientId || clients.length === 0) return;
+    const timer = setTimeout(() => {
       setClientId(
         initialClientId && clients.find((c) => c.id === initialClientId)
           ? initialClientId
           : clients[0].id
       );
-    }
+    }, 0);
+    return () => clearTimeout(timer);
   }, [clients, clientId, initialClientId, isEdit]);
 
   // When the client changes in create mode, auto-adjust the due date to match
   // that client's payment terms (if set), falling back to the user default.
   useEffect(() => {
-    if (isEdit) return;
-    if (!clientId) return;
+    if (isEdit || !clientId) return;
     const client = clients.find((c) => c.id === clientId);
     if (!client) return;
     const clientDueDays = (client as { dueDays?: number | null }).dueDays;
@@ -194,8 +195,9 @@ export function InvoiceForm({
     const due = new Date(baseDate);
     due.setDate(due.getDate() + days);
     const next = toLocalISODate(due);
-    setDueDate((prev) => (prev === next ? prev : next));
-  }, [clientId, clients, defaultDueDays, isEdit]);
+    const timer = setTimeout(() => setDueDate((prev) => (prev === next ? prev : next)), 0);
+    return () => clearTimeout(timer);
+  }, [clientId, clients, defaultDueDays, isEdit, issueDate]);
 
   const totals = useMemo(() => {
     const parsed = items.map((it) => ({
@@ -357,7 +359,6 @@ export function InvoiceForm({
   const headerSubtitle = isEdit
     ? `Update details for ${invoice?.invoiceNumber ?? "this invoice"}`
     : "Create a new invoice to send to your client";
-  const headerIcon = isEdit ? Pencil : Sparkles;
   const submitLabel = isEdit ? "Save Changes" : "Create Invoice";
   const submittingLabel = isEdit ? "Saving..." : "Creating Invoice...";
   const backHref = isEdit && invoice ? `/invoices/${invoice.id}` : "/invoices";

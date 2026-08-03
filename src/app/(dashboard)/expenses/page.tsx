@@ -108,7 +108,10 @@ export default function ExpensesPage() {
     }
   }, []);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    const timer = setTimeout(() => { void load(); }, 0);
+    return () => clearTimeout(timer);
+  }, [load]);
 
   const categories = useMemo(() => {
     if (!expenses) return DEFAULT_EXPENSE_CATEGORIES;

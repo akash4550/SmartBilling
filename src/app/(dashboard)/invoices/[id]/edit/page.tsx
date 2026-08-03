@@ -57,7 +57,10 @@ function EditInvoicePageInner() {
     }
   }, [id]);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    const timer = setTimeout(() => { void load(); }, 0);
+    return () => clearTimeout(timer);
+  }, [load]);
 
   return (
     <div className="space-y-6 no-print">

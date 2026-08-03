@@ -10,10 +10,6 @@ import {
 } from "@/lib/api-helpers";
 import { z } from "zod";
 
-interface RouteParams {
-  params: Promise<{ id: string }>;
-}
-
 const querySchema = z.object({
   from: z
     .string()

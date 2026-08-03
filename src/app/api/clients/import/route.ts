@@ -16,7 +16,6 @@ import { requireUser, unauthorized, jsonError } from "@/lib/api-helpers";
 import { rateLimit, requestKey } from "@/lib/rate-limit";
 import { z } from "zod";
 import { clientSchema } from "@/lib/validations";
-import { logActivity, clientIp } from "@/lib/activity";
 import crypto from "node:crypto";
 
 const importSchema = z.object({

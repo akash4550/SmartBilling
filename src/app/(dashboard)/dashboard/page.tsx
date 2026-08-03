@@ -16,13 +16,11 @@ import {
 import {
   FileText,
   Users,
-  DollarSign,
   Clock,
   FilePlus2,
   UserPlus,
   TrendingUp,
   RefreshCw,
-  Loader2,
   ArrowRight,
   ArrowUpRight,
   AlertTriangle,
@@ -218,7 +216,10 @@ export default function DashboardPage() {
     }
   }, []);
 
-  useEffect(() => { fetchData(); }, [fetchData]);
+  useEffect(() => {
+    const timer = setTimeout(() => { void fetchData(); }, 0);
+    return () => clearTimeout(timer);
+  }, [fetchData]);
 
   return (
     <PageTransition className="space-y-8">
@@ -228,7 +229,7 @@ export default function DashboardPage() {
             Dashboard
           </h1>
           <p className="text-slate-500 dark:text-slate-400 mt-1">
-            Welcome back — here's an overview of your billing
+            Welcome back — here&apos;s an overview of your billing
           </p>
         </div>
         <div className="flex flex-wrap gap-2">

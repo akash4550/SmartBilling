@@ -12,7 +12,6 @@
  * change rarely; when a user updates their logo they'll re-upload and we
  * add ?v=<timestamp> in Settings responses to bust caches.
  */
-import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 
 export const runtime = "nodejs";

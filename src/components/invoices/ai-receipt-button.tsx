@@ -2,7 +2,7 @@
 
 import { useRef, useState, useCallback } from "react";
 import { Button } from "@/components/ui/button";
-import { ScanLine, Loader2, Camera, CheckCircle2, Sparkles } from "lucide-react";
+import { Loader2, Camera, CheckCircle2, Sparkles } from "lucide-react";
 import type { ParsedReceipt } from "@/app/api/parse-receipt/route";
 
 interface AiReceiptButtonProps {

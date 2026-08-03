@@ -11,10 +11,6 @@ import { prisma } from "@/lib/prisma";
 
 export const runtime = "nodejs";
 
-function startOfMonth(d: Date) {
-  return new Date(d.getFullYear(), d.getMonth(), 1);
-}
-
 export async function GET(request: Request) {
   try {
     const user = await requireUser();
@@ -83,16 +79,7 @@ export async function GET(request: Request) {
     currentMonthTax = Math.round(currentMonthTax * 100) / 100;
 
     // YTD
-    const ytdStart = new Date(now.getFullYear(), 0, 1);
-    const ytdAgg = await prisma.invoice.aggregate({
-      _sum: { totalAmount: true, subtotal: true, discountAmount: true },
-      where: {
-        userId: user.id,
-        status: "PAID",
-        paidAt: { gte: ytdStart },
-      },
-    });
-    // Rough YTD tax estimate using average tax rate would be imprecise;
+    const ytdStart = new Date(now.getFullYear(), 0, 1);    // Rough YTD tax estimate using average tax rate would be imprecise;
     // we approximate by pulling all paid invoices' tax.
     const ytdInvoices = await prisma.invoice.findMany({
       where: { userId: user.id, status: "PAID", paidAt: { gte: ytdStart } },

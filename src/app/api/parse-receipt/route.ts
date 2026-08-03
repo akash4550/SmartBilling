@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
 import { z } from "zod";
-import { invoiceItemSchema } from "@/lib/validations";
 import { requireUser, unauthorized } from "@/lib/api-helpers";
 import { rateLimit, requestKey } from "@/lib/rate-limit";
 

@@ -1,10 +1,9 @@
 "use client";
 
-import Link from "next/link";
 import { useEffect, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Receipt, IndianRupee, Loader2, TrendingUp } from "lucide-react";
+import { Receipt, Loader2, TrendingUp } from "lucide-react";
 
 interface TaxData {
   points: Array<{ key: string; label: string; tax: number; revenue: number }>;

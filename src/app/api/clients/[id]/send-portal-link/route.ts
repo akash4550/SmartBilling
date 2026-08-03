@@ -4,7 +4,6 @@ import { requireUser, unauthorized, jsonError } from "@/lib/api-helpers";
 import { rateLimit, requestKey } from "@/lib/rate-limit";
 import { z } from "zod";
 import { sendPortalInviteEmail } from "@/lib/send-portal-invite";
-import { clientIp } from "@/lib/activity";
 
 interface RouteParams {
   params: Promise<{ id: string }>;

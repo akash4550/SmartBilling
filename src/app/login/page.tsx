@@ -48,17 +48,13 @@ function LoginForm() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    setError(null);
-    const err = searchParams.get("error");
-    if (err === "CredentialsSignin") setError("Invalid email or password.");
-    else if (err) setError("Sign-in failed. Please try again.");
-
-    // If redirected from /register, pre-fill the newly registered email.
-    const emailParam = searchParams.get("email");
-    if (emailParam) {
-      setEmail(emailParam);
-      setPassword("");
-    }
+    const timer = setTimeout(() => {
+      const err = searchParams.get("error");
+      setError(err === "CredentialsSignin" ? "Invalid email or password." : err ? "Sign-in failed. Please try again." : null);
+      const emailParam = searchParams.get("email");
+      if (emailParam) { setEmail(emailParam); setPassword(""); }
+    }, 0);
+    return () => clearTimeout(timer);
   }, [searchParams]);
 
   const registered = searchParams.get("registered") === "1";

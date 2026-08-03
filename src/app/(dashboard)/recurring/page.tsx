@@ -48,6 +48,7 @@ export default function RecurringInvoicesPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [now, setNow] = useState(0);
 
   const fetchProfiles = useCallback(async () => {
     setLoading(true);
@@ -64,7 +65,11 @@ export default function RecurringInvoicesPage() {
   }, []);
 
   useEffect(() => {
-    fetchProfiles();
+    const timer = setTimeout(() => {
+      setNow(Date.now());
+      void fetchProfiles();
+    }, 0);
+    return () => clearTimeout(timer);
   }, [fetchProfiles]);
 
   async function toggleActive(id: string, next: boolean) {
@@ -182,7 +187,7 @@ export default function RecurringInvoicesPage() {
       ) : (
         <div className="grid gap-4">
           {profiles.map((p) => {
-            const isDue = new Date(p.nextRunAt).getTime() <= Date.now();
+            const isDue = now > 0 && new Date(p.nextRunAt).getTime() <= now;
             return (
               <Card key={p.id} className={!p.active ? "opacity-70" : ""}>
                 <CardHeader className="pb-3">

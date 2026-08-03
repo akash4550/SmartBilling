@@ -33,8 +33,11 @@ function RegisterForm() {
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
 
   useEffect(() => {
-    const err = searchParams.get("error");
-    if (err === "CredentialsSignin") setError("Sign-in failed. Try logging in.");
+    const timer = setTimeout(() => {
+      const err = searchParams.get("error");
+      setError(err === "CredentialsSignin" ? "Sign-in failed. Try logging in." : null);
+    }, 0);
+    return () => clearTimeout(timer);
   }, [searchParams]);
 
   async function handleSubmit(e: FormEvent) {

@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { useForm } from "react-hook-form";
+import { useForm, useWatch, type Resolver } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -59,12 +59,11 @@ export default function SettingsPage() {
     register,
     handleSubmit,
     reset,
-    watch,
+    control,
     setValue,
     formState: { errors, isDirty },
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
   } = useForm<SettingsInput>({
-    resolver: zodResolver(settingsSchema) as any,
+    resolver: zodResolver(settingsSchema) as Resolver<SettingsInput>,
     defaultValues: {
       companyName: "",
       companyEmail: "",
@@ -82,10 +81,10 @@ export default function SettingsPage() {
     },
   });
 
-  const companyName = watch("companyName");
-  const previewPrefix = watch("invoicePrefix") || "INV";
-  const previewSep = (watch("invoiceSeparator") ?? "-").toString();
-  const previewPad = Number(watch("invoicePad")) || 4;
+  const companyName = useWatch({ control, name: "companyName" });
+  const previewPrefix = useWatch({ control, name: "invoicePrefix" }) || "INV";
+  const previewSep = (useWatch({ control, name: "invoiceSeparator" }) ?? "-").toString();
+  const previewPad = Number(useWatch({ control, name: "invoicePad" })) || 4;
   const previewNumber = `${(previewPrefix || "INV").toUpperCase()}${previewSep}${new Date().toISOString().slice(0, 10).replace(/-/g, "")}${previewSep}${"1".padStart(previewPad, "0")}`;
 
   useEffect(() => {
@@ -123,17 +122,6 @@ export default function SettingsPage() {
       active = false;
     };
   }, [reset]);
-
-  // Keep local brandColor in sync with the form (so the preview updates as
-  // the user types in the hex field too).
-  useEffect(() => {
-    const sub = watch((val, { name }) => {
-      if (name === "brandColor" && val.brandColor) {
-        setBrandColor(String(val.brandColor));
-      }
-    });
-    return () => sub.unsubscribe();
-  }, [watch]);
 
   async function onSubmit(values: SettingsInput) {
     setSaving(true);

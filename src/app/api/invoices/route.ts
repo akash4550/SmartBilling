@@ -170,7 +170,7 @@ export async function POST(request: Request) {
     });
     if (!client) return jsonError("Selected client does not exist", 404);
 
-    const { subtotal, discountAmount, taxAmount: taxAmt, total } = calculateInvoiceTotals(
+    const { subtotal, discountAmount, total } = calculateInvoiceTotals(
       validated.items,
       validated.taxRate,
       validated.discountType

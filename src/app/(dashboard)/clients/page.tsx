@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useEffect, useState, useCallback } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Users, Mail, MapPin, Phone, Plus, FileText, ChevronRight, Loader2, Pencil, Link2, Check, Search } from "lucide-react";
+import { Users, Mail, MapPin, Phone, Plus, FileText, ChevronRight, Pencil, Link2, Check, Search } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { NewClientDialog } from "@/components/clients/new-client-dialog";
 import { EditClientDialog } from "@/components/clients/edit-client-dialog";
@@ -60,7 +60,10 @@ export default function ClientsPage() {
     }
   }, []);
 
-  useEffect(() => { fetchClients(); }, [fetchClients]);
+  useEffect(() => {
+    const timer = setTimeout(() => { void fetchClients(); }, 0);
+    return () => clearTimeout(timer);
+  }, [fetchClients]);
 
   return (
     <div className="space-y-8">

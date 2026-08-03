@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useState, Suspense } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { toast } from "sonner";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -139,17 +139,6 @@ function InvoicesList() {
     return () => clearTimeout(t);
   }, [search]);
 
-  // Reset to page 1 when filters change; also clear selection
-  useEffect(() => {
-    setPage(1);
-    setSelected(new Set());
-  }, [status, debouncedSearch]);
-
-  // Clear selection when data refreshes (avoids stale selected ids)
-  useEffect(() => {
-    setSelected(new Set());
-  }, [page, status]);
-
   // Sync state to URL
   useEffect(() => {
     const params = new URLSearchParams();
@@ -187,7 +176,8 @@ function InvoicesList() {
   }, [page, status, debouncedSearch]);
 
   useEffect(() => {
-    fetchInvoices();
+    const timer = setTimeout(() => { void fetchInvoices(); }, 0);
+    return () => clearTimeout(timer);
   }, [fetchInvoices]);
 
   // The server now handles filtering — we render the page as-is.
@@ -330,7 +320,7 @@ function InvoicesList() {
                   key={tab.value}
                   role="tab"
                   aria-selected={active}
-                  onClick={() => setStatus(tab.value)}
+                  onClick={() => { setStatus(tab.value); setPage(1); setSelected(new Set()); }}
                   className={`inline-flex items-center gap-1.5 px-4 py-1.5 text-sm font-medium rounded-lg transition-all ${
                     active
                       ? "bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-sm"
@@ -358,7 +348,7 @@ function InvoicesList() {
               <Input
                 placeholder="Search invoice #, client name or email..."
                 value={search}
-                onChange={(e) => setSearch(e.target.value)}
+                onChange={(e) => { setSearch(e.target.value); setPage(1); setSelected(new Set()); }}
                 className="pl-9 h-10"
               />
             </div>

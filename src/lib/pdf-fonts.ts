@@ -18,6 +18,7 @@ type FontLike = {
 let registered = false;
 
 export async function registerPdfFonts(Font: FontLike): Promise<void> {
+  void Font;
   if (registered) return;
   try {
     // Font registration is currently disabled because @react-pdf/renderer v4

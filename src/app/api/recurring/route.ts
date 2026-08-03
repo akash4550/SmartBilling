@@ -3,7 +3,6 @@ import { ZodError } from "zod";
 import { prisma } from "@/lib/prisma";
 import { requireUser, unauthorized, jsonError, validationErrorResponse } from "@/lib/api-helpers";
 import { recurringProfileSchema } from "@/lib/validations";
-import { computeNextRun } from "@/lib/recurring";
 
 /**
  * GET /api/recurring

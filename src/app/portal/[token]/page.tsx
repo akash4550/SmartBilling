@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useEffect, useMemo, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -9,7 +9,6 @@ import { Button } from "@/components/ui/button";
 import {
   FileText,
   ShieldCheck,
-  Download,
   ExternalLink,
   Loader2,
   AlertCircle,
@@ -17,12 +16,10 @@ import {
   Clock,
   CheckCircle2,
   AlertTriangle,
-  Building2,
   Mail,
   Phone,
   MapPin,
   Printer,
-  ListChecks,
   CreditCard,
 } from "lucide-react";
 import { PayMethods } from "@/components/invoices/pay-methods";
@@ -184,11 +181,6 @@ function PortalInner() {
       /* ignore */
     }
   };
-
-  const focusInvoice = useMemo(
-    () => (focusInvId ? data?.invoices.find((i) => i.id === focusInvId) ?? null : null),
-    [focusInvId, data],
-  );
 
   // ------------- Loading / Error -------------
   if (loading) {
