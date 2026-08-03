@@ -10,8 +10,8 @@ import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
 import { Receipt, Loader2, AlertCircle, Sparkles, CheckCircle2 } from "lucide-react";
 
-const DEMO_EMAIL = process.env.NODE_ENV === "development" ? "admin@smartbill.com" : "";
-const DEMO_PASSWORD = process.env.NODE_ENV === "development" ? "password123" : "";
+const DEMO_EMAIL = "admin@smartbill.com";
+const DEMO_PASSWORD = "password123";
 
 /**
  * Validate / sanitize the `callbackUrl` so it can't be abused for open-redirect
