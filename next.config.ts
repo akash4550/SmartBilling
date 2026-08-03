@@ -5,6 +5,10 @@ const nextConfig: NextConfig = {
   reactStrictMode: true,
   poweredByHeader: false,
 
+  turbopack: {
+    root: process.cwd(),
+  },
+
   // Only allow images from same-origin (public folder) by default.
   // Add external hostnames here (e.g. avatars, logos) as they are introduced.
   images: {
